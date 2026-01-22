@@ -1,0 +1,29 @@
+# Audio Processing
+pyaudio==0.2.14
+soundfile==0.12.1
+numpy==1.24.3
+scipy==1.11.4
+librosa==0.10.1
+
+# Voice Activity Detection
+webrtcvad==2.0.10  # WebRTC VAD (fast, low-latency, better for high noise)
+# Silero VAD (optional - kept for fallback or comparison)
+# silero-vad==6.2.0
+# torch==2.1.0
+# torchaudio==2.1.0
+
+# Noise Suppression
+noisereduce==3.0.0
+# RNNoise (optional - better for 85dB+ factory noise)
+# Uncomment one of the following:
+# pyrnnoise==0.4.3
+# OR install manually: pip install pyrnnoise
+
+# Web Server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets==12.0
+python-multipart==0.0.6
+
+# Utilities
+python-dotenv==1.0.0
