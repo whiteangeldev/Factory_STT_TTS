@@ -178,8 +178,9 @@ class FactoryVoiceAI {
                         this.updateVisualStatus('listening');
                     }
                 } else if (newState === 'speech_end') {
-                    // Transition state - keep current status
-                    // Will transition to silence shortly
+                    // Speech ended - update immediately
+                    this.updateSystemStatus('listening', 'Listening...');
+                    this.updateVisualStatus('listening');
                 }
             }
         }

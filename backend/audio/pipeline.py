@@ -235,15 +235,16 @@ class AudioPipeline:
                 self.hangover_frames += 1
                 if self.hangover_frames >= self.hangover_max_frames:
                     # Hangover expired, emit speech_end
-                    logger.info(f"Speech hangover expired ({self.hangover_frames} frames), emitting speech_end")
-                    self.speech_state = SpeechState.SPEECH_END
+                    logger.info(f"Speech hangover expired ({self.hangover_frames}/{self.hangover_max_frames} frames), emitting speech_end")
+                    # Emit event BEFORE changing state so frontend can catch it
                     self._emit_event("speech_end", {
                         "timestamp": self._get_timestamp(),
                         "duration_frames": len(self.speech_buffer),
                         "audio_segment": np.concatenate(self.speech_buffer) if self.speech_buffer else None
                     })
-                    self.speech_buffer = []
+                    # Now transition to silence
                     self.speech_state = SpeechState.SILENCE
+                    self.speech_buffer = []
                     self.hangover_frames = 0
             elif self.speech_state == SpeechState.SPEECH_START:
                 # Speech was too short, cancel

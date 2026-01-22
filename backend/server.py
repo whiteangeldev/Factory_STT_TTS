@@ -57,7 +57,16 @@ async def websocket_audio(websocket: WebSocket):
     
     try:
         while True:
-            msg = json.loads(await websocket.receive_text())
+            try:
+                data = await websocket.receive_text()
+                msg = json.loads(data)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON received: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}")
+                break
+            
             msg_type = msg.get("type")
             
             if msg_type == "audio_chunk":
@@ -135,37 +144,42 @@ async def websocket_audio(websocket: WebSocket):
                               f"Latency: {processing_time:.1f}ms")
                 
                 # Send any pending speech events first (before processed_audio)
+                # This ensures events are delivered immediately
                 if websocket in connection_queues:
                     while connection_queues[websocket]:
                         event = connection_queues[websocket].pop(0)
                         try:
                             await websocket.send_json(event)
-                            logger.debug(f"Sent speech event: {event.get('event')}")
+                            logger.info(f"Sent speech event: {event.get('event')} to client")
                         except Exception as e:
                             logger.error(f"Error sending speech event: {e}")
                             break  # Stop if connection is broken
                 
                 # Always send speech_state update immediately (even if no processed audio)
                 # This ensures frontend gets state changes without delay
-                if processed is not None:
-                    processed_bytes = (processed * 32768.0).astype(np.int16).tobytes()
-                    await websocket.send_json({
-                        "type": "processed_audio",
-                        "audio": base64.b64encode(processed_bytes).decode('utf-8'),
-                        "has_speech": True,
-                        "speech_state": speech_state,
-                        "audio_level_db": round(input_db_metric, 2),
-                        "vad_probability": round(vad_prob, 3)
-                    })
-                else:
-                    # Send state update even when no speech (for immediate UI feedback)
-                    await websocket.send_json({
-                        "type": "processed_audio",
-                        "has_speech": False,
-                        "speech_state": speech_state,
-                        "audio_level_db": round(input_db_metric, 2),
-                        "vad_probability": round(vad_prob, 3)
-                    })
+                try:
+                    if processed is not None:
+                        processed_bytes = (processed * 32768.0).astype(np.int16).tobytes()
+                        await websocket.send_json({
+                            "type": "processed_audio",
+                            "audio": base64.b64encode(processed_bytes).decode('utf-8'),
+                            "has_speech": True,
+                            "speech_state": speech_state,
+                            "audio_level_db": round(input_db_metric, 2),
+                            "vad_probability": round(vad_prob, 3)
+                        })
+                    else:
+                        # Send state update even when no speech (for immediate UI feedback)
+                        await websocket.send_json({
+                            "type": "processed_audio",
+                            "has_speech": False,
+                            "speech_state": speech_state,
+                            "audio_level_db": round(input_db_metric, 2),
+                            "vad_probability": round(vad_prob, 3)
+                        })
+                except Exception as e:
+                    logger.error(f"Error sending processed_audio: {e}")
+                    break  # Connection is broken, exit loop
             
             elif msg_type == "calibrate_noise":
                 noise_bytes = base64.b64decode(msg.get("audio"))
