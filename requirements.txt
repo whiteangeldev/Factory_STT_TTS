@@ -8,3 +8,6 @@ websocket-client
 scipy
 openai
 python-dotenv
+setuptools
+sounddevice
+pyaudio
