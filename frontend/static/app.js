@@ -1,705 +1,656 @@
-// Factory Voice AI - Complete Frontend Application
-// Supports: Milestone 1 (Audio Pipeline), Milestone 2 (STT), Milestone 3 (TTS), Milestone 4 (Chatbot)
-
-// Polyfill for older browsers
-(function() {
-    if (navigator.mediaDevices?.getUserMedia) return;
-    if (!navigator.mediaDevices) navigator.mediaDevices = {};
-    const legacy = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
-    if (legacy) {
-        navigator.mediaDevices.getUserMedia = (c) => new Promise((r, e) => legacy.call(navigator, c, r, e));
-    }
-})();
-
-class FactoryVoiceAI {
+// Factory STT/TTS Frontend Application
+class STTApp {
     constructor() {
-        this.ws = null;
-        this.isRecording = false;
-        this.isSpeaking = false;
-        this.mediaStream = null;
+        this.socket = null;
         this.audioContext = null;
-        this.ttsAudio = null;
-        
-        // State management
-        this.currentLanguage = 'auto';
-        this.detectedLanguage = null;
-        this.currentTranscription = '';
-        this.interimTranscription = '';
-        
-        // Statistics
-        this.stats = {
-            chunksProcessed: 0,
-            speechDetected: 0,
-            transcriptions: 0,
-            avgLatency: 0,
-            latencies: []
-        };
-        
-        // Speech state tracking
-        this.speechState = 'silence';
-        this.speechStartTime = null;
-        
-        // Recording buffer with speech tracking
-        this.recordingBuffer = [];
-        this.speechChunks = []; // Track which chunks contain speech
-        this.isSavingRecording = false;
+        this.mediaStream = null;
+        this.processor = null;
+        this.isRecording = false;
+        this.isStopping = false;  // Flag to prevent sending chunks during stop
+        this.audioChunks = [];
+        this.transcriptionBuffer = [];
         
         this.init();
     }
-
+    
     init() {
-        this.setupEventListeners();
         this.connectWebSocket();
-        this.loadConfig();
-        this.checkHTTPSRequirement();
+        this.setupEventListeners();
         this.updateSystemStatus('initializing', 'Initializing...');
+        this.initializeVADIndicator();
     }
-
-    setupEventListeners() {
-        // Control buttons
-        document.getElementById('startBtn').addEventListener('click', () => this.startRecording());
-        document.getElementById('stopBtn').addEventListener('click', () => this.stopRecording());
-        document.getElementById('saveRecordingBtn').addEventListener('click', () => this.saveRecording());
-        document.getElementById('stopTTSBtn').addEventListener('click', () => this.stopTTS());
-
-        // Language selection
-        document.querySelectorAll('.lang-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const lang = e.currentTarget.dataset.lang;
-                this.selectLanguage(lang);
-            });
-        });
+    
+    initializeVADIndicator() {
+        // Initialize VAD indicator to "No Speech" state
+        const vadDot = document.getElementById('vadDot');
+        const vadStatus = document.getElementById('vadStatus');
+        if (vadDot) {
+            vadDot.classList.remove('active');
+        }
+        if (vadStatus) {
+            vadStatus.textContent = 'No Speech';
+            vadStatus.style.color = '#666';
+        }
     }
-
+    
     connectWebSocket() {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws/audio`;
+        const socketUrl = window.location.origin;
+        console.log('🔄 Connecting to Socket.IO:', socketUrl);
         
-        this.ws = new WebSocket(wsUrl);
-
-        this.ws.onopen = () => {
-            this.log('WebSocket connected', 'success');
+        this.socket = io(socketUrl, {
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000,
+            reconnectionAttempts: Infinity
+        });
+        
+        this.socket.on('connect', () => {
+            console.log('✅ Socket.IO connected, ID:', this.socket.id);
+            this.log('Socket.IO connected', 'success');
             this.updateConnectionStatus(true);
             this.updateSystemStatus('ready', 'System Ready');
-        };
-
-        this.ws.onmessage = (event) => {
-            const message = JSON.parse(event.data);
-            this.handleMessage(message);
-        };
-
-        this.ws.onerror = (error) => {
-            this.log('WebSocket error', 'error');
+        });
+        
+        this.socket.on('connected', (data) => {
+            console.log('✅ Server confirmed connection:', data);
+            this.log(data.message || 'Socket.IO ready - VAD and noise reduction active', 'success');
+        });
+        
+        this.socket.on('recording_status', (data) => {
+            console.log('📊 Recording status update:', data);
+            if (data.is_recording) {
+                this.updateSystemStatus('listening', data.status || 'Recording...');
+                if (!this.isRecording) {
+                    // Server confirmed recording started
+                    this.isRecording = true;
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+                    document.getElementById('saveBtn').disabled = false;
+                }
+            } else {
+                this.updateSystemStatus('ready', data.status || 'Ready');
+                if (this.isRecording) {
+                    // Server confirmed recording stopped
+                    this.isRecording = false;
+                    document.getElementById('startBtn').disabled = false;
+                    document.getElementById('stopBtn').disabled = true;
+                }
+            }
+        });
+        
+        this.socket.on('processed_audio', (data) => {
+            // Debug: log VAD data occasionally
+            if (data.has_speech) {
+                console.log('🎤 VAD: Speech detected', data);
+            }
+            this.handleProcessedAudio(data);
+        });
+        
+        this.socket.on('speech_event', (data) => {
+            console.log('🔊 Received speech_event:', data.event, data.data);
+            this.handleSpeechEvent(data);
+        });
+        
+        this.socket.on('transcription', (data) => {
+            console.log('📝 Received transcription:', data.text);
+            this.handleTranscription(data);
+        });
+        
+        this.socket.on('transcription_interim', (data) => {
+            console.log('📝 Received interim transcription:', data.text);
+            this.handleInterimTranscription(data);
+        });
+        
+        this.socket.on('transcription_processing', (data) => {
+            console.log('⏳ Transcription processing:', data.status);
+            if (data.status === 'processing') {
+                this.log(`Processing transcription (${data.audio_duration?.toFixed(2)}s)...`, 'info');
+            }
+        });
+        
+        this.socket.on('error', (data) => {
+            console.error('❌ Server error:', data);
+            this.log(`Error: ${data.message || 'Unknown error'}`, 'error');
+        });
+        
+        this.socket.on('disconnect', (reason) => {
+            console.log('🔌 Socket.IO disconnected:', reason);
+            this.log(`Disconnected: ${reason}`, 'warning');
             this.updateConnectionStatus(false);
-        };
-
-        this.ws.onclose = () => {
-            this.log('WebSocket disconnected', 'warning');
-            this.updateConnectionStatus(false);
-            setTimeout(() => this.connectWebSocket(), 3000);
-        };
+        });
+        
+        this.socket.on('connect_error', (error) => {
+            console.error('❌ Socket.IO connection error:', error);
+            this.log(`Connection error: ${error.message}`, 'error');
+        });
     }
-
-    handleMessage(message) {
-        switch (message.type) {
-            case 'processed_audio':
-                this.handleProcessedAudio(message);
-                break;
-            
-            case 'speech_event':
-                this.handleSpeechEvent(message);
-                break;
-            
-            case 'transcription':
-                this.handleTranscription(message);
-                break;
-            
-            case 'transcription_interim':
-                this.handleInterimTranscription(message);
-                break;
-            
-            case 'tts_audio':
-                this.handleTTSAudio(message);
-                break;
-            
-            case 'tts_start':
-                this.handleTTSStart(message);
-                break;
-            
-            case 'tts_end':
-                this.handleTTSEnd(message);
-                break;
-            
-            case 'language_detected':
-                this.handleLanguageDetected(message);
-                break;
-            
-            case 'chatbot_response':
-                this.handleChatbotResponse(message);
-                break;
-            
-            case 'calibration_complete':
-                this.log('Noise calibration complete', 'success');
-                break;
-            
-            case 'pong':
-                break;
-            
-            default:
-                this.log(`Unknown message type: ${message.type}`, 'warning');
-        }
+    
+    setupEventListeners() {
+        document.getElementById('startBtn').addEventListener('click', () => this.startRecording());
+        document.getElementById('stopBtn').addEventListener('click', () => this.stopRecording());
+        document.getElementById('saveBtn').addEventListener('click', () => this.saveRecording());
     }
-
-    handleProcessedAudio(message) {
-        this.stats.chunksProcessed++;
-        
-        if (message.has_speech) {
-            this.stats.speechDetected++;
-        }
-        
-        // Update speech state IMMEDIATELY (no delay)
-        if (message.speech_state) {
-            const prevState = this.speechState;
-            const newState = message.speech_state;
-            
-            // Only update if state actually changed
-            if (newState !== prevState) {
-                this.speechState = newState;
-                
-                // Update UI immediately based on speech state
-                if (newState === 'speech_start' || newState === 'speech') {
-                    // Speech detected - update immediately
-                    this.updateSystemStatus('listening', 'Speech Detected');
-                    this.updateVisualStatus('speech_start');
-                } else if (newState === 'silence') {
-                    // Speech ended - update immediately
-                    if (prevState === 'speech_start' || prevState === 'speech' || prevState === 'speech_end') {
-                        this.updateSystemStatus('listening', 'Listening...');
-                        this.updateVisualStatus('listening');
-                    }
-                } else if (newState === 'speech_end') {
-                    // Speech ended - update immediately
-                    this.updateSystemStatus('listening', 'Listening...');
-                    this.updateVisualStatus('listening');
-                }
-            }
-        }
-        
-        // Track speech chunks for saving (only save chunks with speech)
-        if (this.isRecording && this.recordingBuffer.length > 0) {
-            const hasSpeech = message.has_speech || 
-                             (message.speech_state === 'speech_start' || 
-                              message.speech_state === 'speech');
-            
-            // Mark the last chunk in recording buffer as speech or not
-            const lastIndex = this.recordingBuffer.length - 1;
-            if (this.speechChunks.length <= lastIndex) {
-                // Extend array if needed
-                while (this.speechChunks.length <= lastIndex) {
-                    this.speechChunks.push(false);
-                }
-            }
-            this.speechChunks[lastIndex] = hasSpeech;
-        }
-        
-        // Update audio level from server (more accurate)
-        if (message.audio_level_db !== undefined) {
-            this.updateAudioLevel(message.audio_level_db);
-        }
-        
-        // Debug: Log VAD probability and audio level
-        if (message.vad_probability !== undefined) {
-            if (!message.has_speech && message.vad_probability > 0.1) {
-                // VAD has some probability but below threshold - log occasionally
-                if (this.stats.chunksProcessed % 50 === 0) {
-                    this.log(`VAD prob: ${(message.vad_probability * 100).toFixed(1)}% (threshold: ${(this.config?.vad_threshold || 0.2) * 100}%), audio: ${message.audio_level_db}dB`, 'info');
-                }
-            }
-        }
-    }
-
-    handleSpeechEvent(message) {
-        const event = message.event;
-        const data = message.data;
-        
-        this.log(`Speech event: ${event}`, 'info');
-        
-        // Update UI IMMEDIATELY when speech events occur (no delay)
-        if (event === 'speech_start') {
-            this.speechStartTime = Date.now();
-            this.currentTranscription = '';
-            this.interimTranscription = '';
-            this.speechState = 'speech_start';
-            
-            // Update UI immediately
-            this.updateTranscriptionStatus('listening', 'Speech Detected');
-            this.updateVisualStatus('speech_start');
-            this.updateSystemStatus('listening', 'Speech Detected');
-        } else if (event === 'speech_end') {
-            // Speech ended - update immediately
-            this.speechState = 'silence';
-            this.updateTranscriptionStatus('listening', 'Listening...');
-            this.updateVisualStatus('listening');
-            this.updateSystemStatus('listening', 'Listening...');
-        }
-    }
-
-    handleTranscription(message) {
-        const text = message.text;
-        const language = message.language || this.detectedLanguage;
-        const confidence = message.confidence || 0;
-        
-        if (text) {
-            this.currentTranscription = text;
-            this.stats.transcriptions++;
-            this.updateTranscription(text, false);
-            this.updateTranscriptionStatus('complete', 'Transcription complete');
-            
-            // Request chatbot response (if STT is ready)
-            this.requestChatbotResponse(text);
-        }
-    }
-
-    handleInterimTranscription(message) {
-        const text = message.text;
-        if (text) {
-            this.interimTranscription = text;
-            this.updateTranscription(text, true);
-        }
-    }
-
-    handleTTSStart(message) {
-        this.isSpeaking = true;
-        this.updateVisualStatus('speaking');
-        this.showTTSPanel(true);
-        this.updateSystemStatus('speaking', 'Speaking...');
-        
-        if (message.text) {
-            document.getElementById('ttsContent').textContent = message.text;
-        }
-    }
-
-    handleTTSAudio(message) {
-        // TTS audio data would be handled here
-        // For now, just show visual feedback
-        this.animateTTS();
-    }
-
-    handleTTSEnd(message) {
-        this.isSpeaking = false;
-        this.updateVisualStatus('ready');
-        this.showTTSPanel(false);
-        this.updateSystemStatus('ready', 'Ready');
-    }
-
-    handleLanguageDetected(message) {
-        const lang = message.language;
-        const confidence = message.confidence || 0;
-        
-        this.detectedLanguage = lang;
-        document.getElementById('detectedLangText').textContent = 
-            this.getLanguageName(lang) + ` (${Math.round(confidence * 100)}%)`;
-        
-        // Update language button if auto-detect is on
-        if (this.currentLanguage === 'auto') {
-            this.highlightDetectedLanguage(lang);
-        }
-    }
-
-    handleChatbotResponse(message) {
-        const response = message.text;
-        const language = message.language || this.currentLanguage;
-        
-        if (response) {
-            this.requestTTS(response, language);
-        }
-    }
-
+    
     async startRecording() {
-        try {
-            const hasModernAPI = navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function';
-            
-            if (!hasModernAPI) {
-                alert('Your browser does not support microphone access. Please use Chrome, Firefox, or Edge.');
+        if (this.isRecording) return;
+        
+        if (!this.socket || !this.socket.connected) {
+            this.log('Socket.IO not connected. Attempting reconnection...', 'warning');
+            this.socket.connect();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (!this.socket.connected) {
+                alert('Failed to connect to server. Please refresh the page.');
                 return;
             }
-
-            this.log('Requesting microphone access...', 'info');
-            
-            const audioConstraints = {
-                echoCancellation: true,
-                noiseSuppression: false,
-                autoGainControl: true,
-                sampleRate: { ideal: 16000 },
-                channelCount: { ideal: 1 }
-            };
-            
-            try {
-                this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-            } catch (e) {
-                this.log('Trying with minimal constraints...', 'warning');
-                this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        
+        // Check if getUserMedia is available
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            const errorMsg = 'Microphone access is not available in this browser. Please use a modern browser (Chrome, Firefox, Edge).';
+            console.error(errorMsg);
+            this.log(errorMsg, 'error');
+            alert(errorMsg);
+            return;
+        }
+        
+        try {
+            // Try to create audio context first
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) {
+                throw new Error('Web Audio API is not supported in this browser');
             }
-
-            const audioTrack = this.mediaStream.getAudioTracks()[0];
+            
+            this.audioContext = new AudioContextClass();
+            
+            // Log actual sample rate (browser may override)
+            const actualSampleRate = this.audioContext.sampleRate;
+            console.log(`AudioContext created with sample rate: ${actualSampleRate} Hz`);
+            this.log(`Audio context: ${actualSampleRate} Hz`, 'info');
+            
+            // Request microphone access with flexible constraints
+            console.log('Requesting microphone access...');
+            this.log('Requesting microphone permission...', 'info');
+            
+            let stream;
+            try {
+                // First try with ideal constraints
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: { ideal: 1 },
+                        sampleRate: { ideal: 16000 },
+                        echoCancellation: { ideal: true },
+                        noiseSuppression: { ideal: true },
+                        autoGainControl: { ideal: true }
+                    }
+                });
+            } catch (err) {
+                console.warn('Failed with ideal constraints, trying basic constraints:', err);
+                // Fallback to basic constraints
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: true
+                });
+            }
+            
+            console.log('Microphone access granted');
+            this.log('Microphone access granted', 'success');
+            
+            // Get actual audio track settings
+            const audioTrack = stream.getAudioTracks()[0];
             const settings = audioTrack.getSettings();
-            const actualSampleRate = settings.sampleRate || 48000;
-
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: actualSampleRate
-            });
-
-            const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+            console.log('Audio track settings:', settings);
+            this.log(`Audio: ${settings.sampleRate || 'unknown'} Hz, ${settings.channelCount || 'unknown'} channels`, 'info');
+            
+            this.mediaStream = stream;
+            this.isRecording = true;
+            this.isStopping = false;  // Reset stopping flag when starting
+            this.audioChunks = [];
+            this.transcriptionBuffer = [];
+            
+            // Clear transcription area
+            const area = document.getElementById('transcriptionArea');
+            area.innerHTML = '';
+            
+            // Setup audio processing using AudioWorkletNode (modern) or fallback to ScriptProcessor
+            const source = this.audioContext.createMediaStreamSource(stream);
+            
+            // Use ScriptProcessorNode (deprecated but widely supported)
+            // Buffer size must be a power of 2 between 256 and 16384
+            // 512 samples = 32ms at 16kHz
             const bufferSize = 512;
-            const processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
-
-            processor.onaudioprocess = (e) => {
+            
+            // Create processor node
+            this.processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
+            
+            this.processor.onaudioprocess = (e) => {
                 if (!this.isRecording) return;
-
+                
                 const inputData = e.inputBuffer.getChannelData(0);
                 
-                // Store in recording buffer for saving (keep original sample rate)
-                // Note: speechChunks will be updated in handleProcessedAudio based on VAD results
-                this.recordingBuffer.push(new Float32Array(inputData));
+                // Check if we actually have audio data
+                const maxLevel = Math.max(...Array.from(inputData).map(Math.abs));
+                const rms = Math.sqrt(Array.from(inputData).reduce((sum, val) => sum + val * val, 0) / inputData.length);
                 
-                // Keep buffer size reasonable (last 60 seconds)
-                const maxBufferSize = this.audioContext.sampleRate * 60;
-                let totalSamples = 0;
-                for (let i = this.recordingBuffer.length - 1; i >= 0; i--) {
-                    totalSamples += this.recordingBuffer[i].length;
-                    if (totalSamples > maxBufferSize) {
-                        const removed = this.recordingBuffer.length - (i + 1);
-                        this.recordingBuffer = this.recordingBuffer.slice(i + 1);
-                        this.speechChunks = this.speechChunks.slice(removed);
-                        break;
+                // Log first few chunks for debugging
+                if (!this.processor._debugCount) {
+                    this.processor._debugCount = 0;
+                }
+                this.processor._debugCount++;
+                if (this.processor._debugCount <= 5) {
+                    console.log(`[Audio Debug ${this.processor._debugCount}] Samples: ${inputData.length}, SampleRate: ${this.audioContext.sampleRate}Hz, MaxLevel: ${maxLevel.toFixed(6)}, RMS: ${rms.toFixed(6)}`);
+                }
+                
+                if (maxLevel < 0.0001) {
+                    // Very quiet or silent - might be muted or no input
+                    if (this.processor._debugCount <= 10) {
+                        console.warn(`[Audio Debug ${this.processor._debugCount}] Audio level very low: ${maxLevel.toFixed(6)} - check microphone`);
                     }
                 }
                 
-                let audioData = inputData;
-                if (this.audioContext.sampleRate !== 16000) {
-                    audioData = this.resampleAudio(inputData, this.audioContext.sampleRate, 16000);
-                }
-                
-                this.processAudioChunk(audioData);
+                // Send the raw audio data (will be resampled if needed)
+                this.processAudioChunk(inputData, this.audioContext.sampleRate);
             };
-
-            source.connect(processor);
-            processor.connect(this.audioContext.destination);
-
-            this.isRecording = true;
-            this.recordingBuffer = []; // Reset recording buffer
-            this.speechChunks = []; // Reset speech tracking
-            this.updateControls(true);
-            this.updateVisualStatus('listening');
+            
+            // Connect: source -> processor -> destination (to avoid audio feedback, connect to destination)
+            source.connect(this.processor);
+            this.processor.connect(this.audioContext.destination);
+            
+            // Notify backend that recording has started
+            if (this.socket && this.socket.connected) {
+                this.socket.emit('start_recording');
+            }
+            
+            // Update UI
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('saveBtn').disabled = false;
+            
             this.updateSystemStatus('listening', 'Listening...');
-            this.log('Recording started', 'success');
-
+            this.log('Recording started successfully', 'success');
+            
         } catch (error) {
-            this.handleMicrophoneError(error);
+            console.error('Error starting recording:', error);
+            console.error('Error name:', error.name);
+            console.error('Error message:', error.message);
+            
+            let errorMsg = 'Failed to access microphone. ';
+            
+            if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                errorMsg += 'Please allow microphone access in your browser settings and try again.';
+            } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                errorMsg += 'No microphone found. Please connect a microphone and try again.';
+            } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+                errorMsg += 'Microphone is being used by another application. Please close other apps and try again.';
+            } else if (error.name === 'OverconstrainedError') {
+                errorMsg += 'Microphone does not support required settings. Trying with basic settings...';
+                // Could retry with basic constraints here
+            } else {
+                errorMsg += `Error: ${error.message || error.name}`;
+            }
+            
+            this.log(errorMsg, 'error');
+            alert(errorMsg);
+            
+            // Reset UI
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
         }
     }
-
+    
     stopRecording() {
+        if (!this.isRecording) return;
+        
+        // Set stopping flag FIRST to prevent any new chunks from being sent
+        this.isStopping = true;
+        
+        // Set recording flag to false to stop any in-flight processing
         this.isRecording = false;
         
+        // Notify backend that recording has stopped IMMEDIATELY
+        if (this.socket && this.socket.connected) {
+            this.socket.emit('stop_recording');
+        }
+        
+        // Disconnect processor immediately to stop audio capture
+        if (this.processor) {
+            try {
+                this.processor.disconnect();
+            } catch (e) {
+                console.warn('Error disconnecting processor:', e);
+            }
+            this.processor = null;
+        }
+        
+        // Stop media stream tracks
         if (this.mediaStream) {
-            this.mediaStream.getTracks().forEach(track => track.stop());
+            this.mediaStream.getTracks().forEach(track => {
+                try {
+                    track.stop();
+                } catch (e) {
+                    console.warn('Error stopping track:', e);
+                }
+            });
             this.mediaStream = null;
         }
-
+        
+        // Close audio context
         if (this.audioContext) {
-            this.audioContext.close();
+            try {
+                this.audioContext.close();
+            } catch (e) {
+                console.warn('Error closing audio context:', e);
+            }
             this.audioContext = null;
         }
-
-        this.updateControls(false);
-        this.updateVisualStatus('ready');
+        
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+        
         this.updateSystemStatus('ready', 'Ready');
-        this.log('Recording stopped', 'info');
-    }
-
-    processAudioChunk(audioData) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-        const rms = Math.sqrt(audioData.reduce((sum, val) => sum + val * val, 0) / audioData.length);
-        // Calculate dB: 20 * log10(rms), with -∞ for silence
-        const audioLevelDb = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
-        this.updateAudioLevel(audioLevelDb);
-
-        const int16Array = new Int16Array(audioData.length);
-        for (let i = 0; i < audioData.length; i++) {
-            const s = Math.max(-1, Math.min(1, audioData[i]));
-            int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        const base64 = this.arrayBufferToBase64(int16Array.buffer);
-        const startTime = performance.now();
-
-        this.ws.send(JSON.stringify({
-            type: 'audio_chunk',
-            audio: base64,
-            language: this.currentLanguage === 'auto' ? null : this.currentLanguage
-        }));
-
-        const latency = performance.now() - startTime;
-        this.stats.latencies.push(latency);
-        if (this.stats.latencies.length > 100) {
-            this.stats.latencies.shift();
-        }
-        this.stats.avgLatency = Math.round(
-            this.stats.latencies.reduce((a, b) => a + b, 0) / this.stats.latencies.length
-        );
-    }
-
-    selectLanguage(lang) {
-        this.currentLanguage = lang;
+        this.log(`Recording stopped: ${this.audioChunks.length} chunks buffered`, 'info');
         
-        document.querySelectorAll('.lang-btn').forEach(btn => {
-            btn.classList.remove('active');
-        });
-        document.getElementById(`lang${lang.charAt(0).toUpperCase() + lang.slice(1)}`).classList.add('active');
-        
-        this.log(`Language set to: ${this.getLanguageName(lang)}`, 'info');
+        // Reset stopping flag after a short delay to allow any pending callbacks to finish
+        setTimeout(() => {
+            this.isStopping = false;
+        }, 100);
     }
-
-    highlightDetectedLanguage(lang) {
-        // Visual feedback for detected language
-        const langMap = { 'en': 'En', 'ja': 'Ja', 'zh': 'Zh' };
-        const btnId = `lang${langMap[lang] || 'Auto'}`;
-        const btn = document.getElementById(btnId);
-        if (btn) {
-            btn.classList.add('detected');
-            setTimeout(() => btn.classList.remove('detected'), 2000);
-        }
-    }
-
-    getLanguageName(code) {
-        const names = {
-            'auto': 'Auto-detect',
-            'en': 'English',
-            'ja': 'Japanese',
-            'zh': 'Chinese'
-        };
-        return names[code] || code;
-    }
-
-
-    updateTranscription(text, isInterim) {
-        if (isInterim) {
-            document.getElementById('transcriptionInterim').textContent = text;
-            document.getElementById('transcriptionContent').classList.add('has-interim');
-        } else {
-            document.getElementById('transcriptionContent').textContent = text;
-            document.getElementById('transcriptionInterim').textContent = '';
-            document.getElementById('transcriptionContent').classList.remove('has-interim');
-        }
-    }
-
-    updateTranscriptionStatus(status, text) {
-        const statusEl = document.getElementById('transcriptionStatus');
-        const dot = statusEl.querySelector('.status-dot');
-        const textSpan = statusEl.querySelector('span:last-child');
-        
-        statusEl.className = `transcription-status ${status}`;
-        textSpan.textContent = text;
-    }
-
-    updateVisualStatus(state) {
-        const circle = document.getElementById('statusCircle');
-        const icon = document.getElementById('statusIcon');
-        const text = document.getElementById('statusText');
-        const waves = document.getElementById('statusWaves');
-        
-        circle.className = `status-circle ${state}`;
-        
-        const states = {
-            'ready': { icon: '🎤', text: 'Ready', color: '#4CAF50' },
-            'listening': { icon: '👂', text: 'Listening...', color: '#2196F3' },
-            'speech_start': { icon: '🗣️', text: 'Speech Detected', color: '#FF9800' },
-            'processing': { icon: '⚙️', text: 'Processing...', color: '#9C27B0' },
-            'speaking': { icon: '🔊', text: 'Speaking...', color: '#F44336' }
-        };
-        
-        const stateInfo = states[state] || states['ready'];
-        icon.textContent = stateInfo.icon;
-        text.textContent = stateInfo.text;
-        circle.style.borderColor = stateInfo.color;
-        
-        // Animate waves for active states
-        if (['listening', 'speech_start', 'speaking'].includes(state)) {
-            waves.style.display = 'block';
-            waves.className = `status-waves ${state}`;
-        } else {
-            waves.style.display = 'none';
-        }
-    }
-
-    updateSystemStatus(component, status) {
-        // Update individual component statuses
-        const statusMap = {
-            'pipeline': 'pipelineStatus',
-            'stt': 'sttStatus',
-            'tts': 'ttsStatus',
-            'vad': 'vadStatus'
-        };
-        
-        if (statusMap[component]) {
-            document.getElementById(statusMap[component]).textContent = status;
+    
+    processAudioChunk(audioData, sourceSampleRate = 16000) {
+        // Only process if recording and not stopping
+        if (!this.isRecording || this.isStopping) {
+            return;
         }
         
-        // Update main system status
-        if (component === 'ready' || component === 'listening' || component === 'speaking') {
-            const systemStatus = document.getElementById('systemStatus');
-            systemStatus.querySelector('span:last-child').textContent = status;
-            systemStatus.className = `status-badge ${component}`;
+        if (!this.socket || !this.socket.connected) {
+            console.warn('⚠️ Socket.IO disconnected - audio captured locally but not processed');
+            // Still store audio locally even if socket is disconnected
+        }
+        
+        // Resample to 16kHz if needed (do this BEFORE checking audio level)
+        let processedData = audioData;
+        if (Math.abs(sourceSampleRate - 16000) > 100) { // Only resample if significantly different
+            processedData = this.resample(audioData, sourceSampleRate, 16000);
+            if (!this._resampleLogged) {
+                console.log(`Resampled from ${sourceSampleRate}Hz to 16kHz: ${audioData.length} -> ${processedData.length} samples`);
+                this._resampleLogged = true;
+            }
+        }
+        
+        // Ensure we have valid data
+        if (processedData.length === 0) {
+            console.warn('Empty audio data after processing');
+            return;
+        }
+        
+        // Store for saving - ALWAYS store the resampled audio at 16kHz (processedData)
+        // This ensures the saved audio matches what was sent to the server and plays at correct speed
+        this.audioChunks.push(processedData.slice());
+        
+        // Check audio level for sending (but still store for saving)
+        const maxLevel = Math.max(...Array.from(processedData).map(Math.abs));
+        if (maxLevel < 0.0001) {
+            // Skip sending silent chunks to reduce bandwidth, but we already stored it above
+            return;
+        }
+        
+        // Convert Float32Array to Int16Array for sending to server
+        // Proper conversion: map [-1, 1] to [-32768, 32767]
+        const int16Array = new Int16Array(processedData.length);
+        for (let i = 0; i < processedData.length; i++) {
+            // Clamp to [-1, 1] range
+            const s = Math.max(-1, Math.min(1, processedData[i]));
+            // Convert to int16: multiply by 32768 and clamp
+            int16Array[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32768)));
+        }
+        
+        // Verify conversion (debug first few chunks)
+        if (!this._conversionDebugCount) {
+            this._conversionDebugCount = 0;
+        }
+        this._conversionDebugCount++;
+        if (this._conversionDebugCount <= 3) {
+            const maxFloat = Math.max(...Array.from(processedData).map(Math.abs));
+            const maxInt16 = Math.max(...Array.from(int16Array).map(Math.abs));
+            console.log(`[Conversion Debug ${this._conversionDebugCount}] Float max: ${maxFloat.toFixed(6)}, Int16 max: ${maxInt16}, samples: ${processedData.length}`);
+        }
+        
+        // Convert to base64 using ArrayBuffer (proper binary encoding)
+        // Use chunked approach to avoid "Maximum call stack size exceeded" for large arrays
+        const uint8Array = new Uint8Array(int16Array.buffer);
+        let binaryString = '';
+        const chunkSize = 8192; // Process in chunks to avoid stack overflow
+        for (let i = 0; i < uint8Array.length; i += chunkSize) {
+            const chunk = uint8Array.slice(i, Math.min(i + chunkSize, uint8Array.length));
+            binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+        }
+        const base64 = btoa(binaryString);
+        
+        // Send to server (only if connected AND still recording AND not stopping)
+        // Triple-check to prevent race conditions
+        if (this.isRecording && !this.isStopping && this.socket && this.socket.connected) {
+            try {
+                this.socket.emit('audio_chunk', { audio: base64 });
+            } catch (error) {
+                console.error('Error sending audio chunk:', error);
+            }
         }
     }
-
-    showTTSPanel(show) {
-        document.getElementById('ttsPanel').style.display = show ? 'block' : 'none';
+    
+    resample(input, inputSampleRate, outputSampleRate) {
+        if (Math.abs(inputSampleRate - outputSampleRate) < 100) {
+            return input; // Close enough, no resampling needed
+        }
+        
+        const ratio = inputSampleRate / outputSampleRate;
+        const outputLength = Math.round(input.length / ratio);
+        
+        // Ensure output length is reasonable
+        if (outputLength <= 0 || outputLength > input.length * 2) {
+            console.error(`Invalid resample output length: ${outputLength} from ${input.length} samples`);
+            return input; // Return original if resampling would be invalid
+        }
+        
+        const output = new Float32Array(outputLength);
+        
+        // Linear interpolation resampling
+        for (let i = 0; i < outputLength; i++) {
+            const index = i * ratio;
+            const indexFloor = Math.floor(index);
+            const indexCeil = Math.min(indexFloor + 1, input.length - 1);
+            const fraction = index - indexFloor;
+            
+            // Clamp to valid range
+            const val1 = input[Math.max(0, Math.min(indexFloor, input.length - 1))];
+            const val2 = input[Math.max(0, Math.min(indexCeil, input.length - 1))];
+            
+            output[i] = val1 * (1 - fraction) + val2 * fraction;
+        }
+        
+        return output;
     }
-
-    animateTTS() {
-        const visualizer = document.getElementById('ttsVisualizer');
-        const wave = visualizer.querySelector('.tts-wave');
-        if (wave) {
-            wave.style.animation = 'none';
-            setTimeout(() => {
-                wave.style.animation = 'ttsWave 1s ease-in-out infinite';
-            }, 10);
+    
+    handleProcessedAudio(data) {
+        // Update VAD indicator (green dot in metrics)
+        const vadDot = document.getElementById('vadDot');
+        const vadStatus = document.getElementById('vadStatus');
+        
+        if (data.has_speech !== undefined) {
+            if (data.has_speech) {
+                // Speech detected - show green dot
+                if (vadDot) vadDot.classList.add('active');
+                if (vadStatus) {
+                    vadStatus.textContent = 'Speech Detected';
+                    vadStatus.style.color = '#4CAF50';
+                }
+                
+                // Also update header status dot to show speech is detected
+                if (this.isRecording) {
+                    this.updateSystemStatus('speech_detected', 'Speech Detected');
+                }
+            } else {
+                // No speech - hide green dot
+                if (vadDot) vadDot.classList.remove('active');
+                if (vadStatus) {
+                    if (data.speech_state === 'buffering') {
+                        vadStatus.textContent = 'Buffering...';
+                        vadStatus.style.color = '#FF9800';
+                    } else {
+                        vadStatus.textContent = 'No Speech';
+                        vadStatus.style.color = '#666';
+                    }
+                }
+                
+                // Update header status back to listening if recording and not buffering
+                if (this.isRecording && data.speech_state !== 'buffering' && data.speech_state !== 'speech') {
+                    this.updateSystemStatus('listening', 'Listening...');
+                }
+            }
+        }
+        
+        // Update metrics
+        if (data.audio_level_db !== undefined) {
+            const audioLevelEl = document.getElementById('audioLevel');
+            if (audioLevelEl) {
+                audioLevelEl.textContent = `${data.audio_level_db.toFixed(1)} dB`;
+            }
+        }
+        
+        if (data.vad_probability !== undefined) {
+            const vadProbEl = document.getElementById('vadProbability');
+            if (vadProbEl) {
+                vadProbEl.textContent = data.vad_probability.toFixed(3);
+            }
+        }
+        
+        if (data.speech_state) {
+            const speechStateEl = document.getElementById('speechState');
+            if (speechStateEl) {
+                speechStateEl.textContent = data.speech_state;
+            }
         }
     }
-
-    stopTTS() {
-        if (this.ttsAudio) {
-            this.ttsAudio.pause();
-            this.ttsAudio = null;
-        }
-        this.handleTTSEnd({});
-    }
-
-    requestChatbotResponse(text) {
-        // Send to backend for chatbot processing
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({
-                type: 'chatbot_request',
-                text: text,
-                language: this.currentLanguage === 'auto' ? this.detectedLanguage : this.currentLanguage
-            }));
+    
+    handleSpeechEvent(data) {
+        const eventType = data.event;
+        const eventData = data.data || {};
+        
+        if (eventType === 'speech_start') {
+            this.updateSystemStatus('speech_detected', 'Speech Detected');
+            this.log('Speech detected', 'success');
+        } else if (eventType === 'speech_end') {
+            this.updateSystemStatus('listening', 'Listening...');
+            this.log(`Speech ended (duration: ${eventData.duration?.toFixed(2)}s)`, 'info');
         }
     }
-
-    requestTTS(text, language) {
-        // Request TTS from backend
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({
-                type: 'tts_request',
-                text: text,
-                language: language || this.currentLanguage
-            }));
+    
+    handleTranscription(data) {
+        const text = data.text || '';
+        if (!text) return;
+        
+        const area = document.getElementById('transcriptionArea');
+        const item = document.createElement('div');
+        item.className = 'transcription-item final';
+        item.textContent = text;
+        area.appendChild(item);
+        area.scrollTop = area.scrollHeight;
+        
+        this.log(`Final transcription: ${text.substring(0, 50)}...`, 'success');
+    }
+    
+    handleInterimTranscription(data) {
+        const text = data.text || '';
+        if (!text) return;
+        
+        const area = document.getElementById('transcriptionArea');
+        
+        // Remove previous interim item if exists
+        const existingInterim = area.querySelector('.transcription-item.interim');
+        if (existingInterim) {
+            existingInterim.remove();
+        }
+        
+        // Add new interim item
+        const item = document.createElement('div');
+        item.className = 'transcription-item interim';
+        item.textContent = text;
+        area.appendChild(item);
+        area.scrollTop = area.scrollHeight;
+    }
+    
+    updateSystemStatus(state, text) {
+        const statusBadge = document.getElementById('systemStatus');
+        if (statusBadge) {
+            statusBadge.className = `status-badge ${state}`;
+            const textSpan = statusBadge.querySelector('span:last-child');
+            if (textSpan) {
+                textSpan.textContent = text;
+            }
+            console.log(`🟢 Status updated: ${state} - ${text}`);
         }
     }
-
-
+    
+    updateConnectionStatus(connected) {
+        // Update connection indicator if needed
+    }
+    
+    log(message, type = 'info') {
+        const logArea = document.getElementById('logArea');
+        if (!logArea) return;
+        
+        const entry = document.createElement('div');
+        entry.className = `log-entry ${type}`;
+        entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+        logArea.appendChild(entry);
+        logArea.scrollTop = logArea.scrollHeight;
+        
+        // Keep only last 50 entries
+        while (logArea.children.length > 50) {
+            logArea.removeChild(logArea.firstChild);
+        }
+    }
+    
     async saveRecording() {
-        if (!this.isRecording) {
-            alert('Please start recording first');
+        if (this.audioChunks.length === 0) {
+            alert('No audio recorded');
             return;
         }
-        
-        if (this.isSavingRecording) {
-            this.log('Recording save already in progress...', 'warning');
-            return;
-        }
-        
-        this.isSavingRecording = true;
-        this.log('Saving recording (speech only)...', 'info');
         
         try {
-            // Filter to only speech chunks
-            const speechOnlyChunks = [];
-            for (let i = 0; i < this.recordingBuffer.length; i++) {
-                if (this.speechChunks[i] === true) {
-                    speechOnlyChunks.push(this.recordingBuffer[i]);
-                }
-            }
-            
-            if (speechOnlyChunks.length === 0) {
-                alert('No speech detected in recording. Please speak into the microphone.');
-                this.isSavingRecording = false;
-                return;
-            }
-            
-            // Add small padding around speech segments (100ms before/after)
-            const paddedChunks = [];
-            const paddingSamples = Math.floor((this.audioContext ? this.audioContext.sampleRate : 48000) * 0.1); // 100ms
-            
-            for (let i = 0; i < this.recordingBuffer.length; i++) {
-                if (this.speechChunks[i] === true) {
-                    // Add padding before (if previous chunk exists)
-                    if (i > 0 && paddedChunks.length === 0) {
-                        const prevChunk = this.recordingBuffer[i - 1];
-                        const padding = prevChunk.slice(-Math.min(paddingSamples, prevChunk.length));
-                        paddedChunks.push(padding);
-                    }
-                    
-                    // Add speech chunk
-                    paddedChunks.push(this.recordingBuffer[i]);
-                    
-                    // Add padding after (if next chunk exists and is not speech)
-                    if (i < this.recordingBuffer.length - 1 && this.speechChunks[i + 1] !== true) {
-                        const nextChunk = this.recordingBuffer[i + 1];
-                        const padding = nextChunk.slice(0, Math.min(paddingSamples, nextChunk.length));
-                        paddedChunks.push(padding);
-                    }
-                }
-            }
-            
-            // Combine all speech chunks
-            const totalSamples = paddedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-            const combinedAudio = new Float32Array(totalSamples);
+            // Combine all audio chunks
+            const totalLength = this.audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const combinedAudio = new Float32Array(totalLength);
             let offset = 0;
-            for (const chunk of paddedChunks) {
+            
+            for (const chunk of this.audioChunks) {
                 combinedAudio.set(chunk, offset);
                 offset += chunk.length;
             }
             
-            // Convert to WAV format
-            const sampleRate = this.audioContext ? this.audioContext.sampleRate : 48000;
-            const wavBlob = this.audioToWav(combinedAudio, sampleRate);
+            // Convert to WAV
+            const wav = this.float32ToWav(combinedAudio, 16000);
+            const blob = new Blob([wav], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
             
-            // Create download link
-            const url = URL.createObjectURL(wavBlob);
+            // Download
             const a = document.createElement('a');
             a.href = url;
-            const speechDuration = (combinedAudio.length / sampleRate).toFixed(1);
-            a.download = `speech_${speechDuration}s_${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
-            document.body.appendChild(a);
+            a.download = `recording_${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
             a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
             
-            this.log(`Speech recording saved: ${a.download} (${speechDuration}s)`, 'success');
+            URL.revokeObjectURL(url);
+            this.log('Recording saved', 'success');
             
         } catch (error) {
-            this.log('Error saving recording: ' + error.message, 'error');
-            alert('Failed to save recording: ' + error.message);
-        } finally {
-            this.isSavingRecording = false;
+            console.error('Error saving recording:', error);
+            alert(`Failed to save recording: ${error.message}`);
         }
     }
     
-    audioToWav(audioData, sampleRate) {
-        // Convert Float32Array to Int16Array
-        const int16Array = new Int16Array(audioData.length);
-        for (let i = 0; i < audioData.length; i++) {
-            const s = Math.max(-1, Math.min(1, audioData[i]));
-            int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        
-        // Create WAV file header
-        const buffer = new ArrayBuffer(44 + int16Array.length * 2);
-        const view = new DataView(buffer);
+    float32ToWav(buffer, sampleRate) {
+        const length = buffer.length;
+        const arrayBuffer = new ArrayBuffer(44 + length * 2);
+        const view = new DataView(arrayBuffer);
+        const samples = new Int16Array(arrayBuffer, 44);
         
         // WAV header
         const writeString = (offset, string) => {
@@ -709,182 +660,30 @@ class FactoryVoiceAI {
         };
         
         writeString(0, 'RIFF');
-        view.setUint32(4, 36 + int16Array.length * 2, true);
+        view.setUint32(4, 36 + length * 2, true);
         writeString(8, 'WAVE');
         writeString(12, 'fmt ');
-        view.setUint32(16, 16, true); // fmt chunk size
-        view.setUint16(20, 1, true); // audio format (1 = PCM)
-        view.setUint16(22, 1, true); // number of channels
-        view.setUint32(24, sampleRate, true); // sample rate
-        view.setUint32(28, sampleRate * 2, true); // byte rate
-        view.setUint16(32, 2, true); // block align
-        view.setUint16(34, 16, true); // bits per sample
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
         writeString(36, 'data');
-        view.setUint32(40, int16Array.length * 2, true);
+        view.setUint32(40, length * 2, true);
         
-        // Write audio data
-        let offset = 44;
-        for (let i = 0; i < int16Array.length; i++) {
-            view.setInt16(offset, int16Array[i], true);
-            offset += 2;
+        // Convert float32 to int16
+        for (let i = 0; i < length; i++) {
+            const s = Math.max(-1, Math.min(1, buffer[i]));
+            samples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        return new Blob([buffer], { type: 'audio/wav' });
-    }
-
-    updateConnectionStatus(connected) {
-        const status = document.getElementById('connectionStatus');
-        const dot = status.querySelector('.connection-dot');
-        const text = status.querySelector('span:last-child');
-        
-        if (connected) {
-            status.classList.add('connected');
-            text.textContent = 'Connected';
-        } else {
-            status.classList.remove('connected');
-            text.textContent = 'Disconnected';
-        }
-    }
-
-    updateAudioLevel(levelDb) {
-        const meterBar = document.getElementById('audioMeterBar');
-        const levelText = document.getElementById('audioLevelText');
-        
-        // Convert dB to percentage for visual meter (dB range: -60 to 0)
-        // -60dB = 0%, 0dB = 100%
-        const minDb = -60;
-        const maxDb = 0;
-        const normalizedLevel = Math.max(0, Math.min(100, ((levelDb - minDb) / (maxDb - minDb)) * 100));
-        
-        meterBar.style.width = normalizedLevel + '%';
-        
-        // Color coding: green (-20 to 0), yellow (-40 to -20), red (< -40)
-        let colorClass = 'low';
-        if (levelDb >= -20) {
-            colorClass = 'high';
-        } else if (levelDb >= -40) {
-            colorClass = 'medium';
-        }
-        meterBar.className = `audio-meter-bar ${colorClass}`;
-        
-        // Display dB value
-        if (levelDb === -Infinity || isNaN(levelDb)) {
-            levelText.textContent = '-∞ dB';
-        } else {
-            levelText.textContent = levelDb.toFixed(1) + ' dB';
-        }
-    }
-
-    updateControls(recording) {
-        document.getElementById('startBtn').disabled = recording;
-        document.getElementById('stopBtn').disabled = !recording;
-        document.getElementById('saveRecordingBtn').disabled = !recording;
-    }
-
-
-    async loadConfig() {
-        try {
-            const response = await fetch('/api/config');
-            const config = await response.json();
-            this.config = config;
-        } catch (error) {
-            this.log('Failed to load config: ' + error.message, 'warning');
-        }
-    }
-
-    handleMicrophoneError(error) {
-        let errorMessage = 'Failed to access microphone. ';
-        
-        if (error.name === 'NotAllowedError') {
-            errorMessage += 'Please grant microphone permissions.';
-        } else if (error.name === 'NotFoundError') {
-            errorMessage += 'No microphone found.';
-        } else {
-            errorMessage += error.message;
-        }
-        
-        this.log(errorMessage, 'error');
-        alert(errorMessage);
-    }
-
-    checkHTTPSRequirement() {
-        const isHTTP = location.protocol === 'http:';
-        const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0', ''].includes(location.hostname);
-        
-        if (isHTTP && !isLocalhost) {
-            this.log('⚠️ HTTPS required for microphone access on non-localhost', 'warning');
-        }
-    }
-
-    resampleAudio(audioData, fromRate, toRate) {
-        if (fromRate === toRate) return audioData;
-        
-        const ratio = fromRate / toRate;
-        const newLength = Math.round(audioData.length / ratio);
-        const resampled = new Float32Array(newLength);
-        
-        for (let i = 0; i < newLength; i++) {
-            const srcIndex = i / ratio;
-            const srcIndexFloor = Math.floor(srcIndex);
-            const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
-            const t = srcIndex - srcIndexFloor;
-            
-            resampled[i] = audioData[srcIndexFloor] * (1 - t) + audioData[srcIndexCeil] * t;
-        }
-        
-        return resampled;
-    }
-
-    arrayBufferToBase64(buffer) {
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
-    }
-
-
-    log(message, type = 'info') {
-        const logContent = document.getElementById('logContent');
-        const timestamp = new Date().toLocaleTimeString();
-        const logEntry = document.createElement('div');
-        logEntry.className = `log-entry ${type}`;
-        logEntry.textContent = `[${timestamp}] ${message}`;
-        
-        logContent.appendChild(logEntry);
-        logContent.scrollTop = logContent.scrollHeight;
-        
-        while (logContent.children.length > 50) {
-            logContent.removeChild(logContent.firstChild);
-        }
+        return arrayBuffer;
     }
 }
 
-// Utility functions
-function togglePanel(header) {
-    const content = header.nextElementSibling;
-    const icon = header.querySelector('.toggle-icon');
-    if (content.style.display === 'none') {
-        content.style.display = 'block';
-        icon.textContent = '▼';
-    } else {
-        content.style.display = 'none';
-        icon.textContent = '▶';
-    }
-}
-
-function closeModal(modalId) {
-    document.getElementById(modalId).style.display = 'none';
-}
-
-// Initialize app
+// Initialize app when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
-    window.voiceAI = new FactoryVoiceAI();
-});
-
-window.addEventListener('beforeunload', () => {
-    if (window.voiceAI) {
-        window.voiceAI.stopRecording();
-    }
+    window.app = new STTApp();
 });

@@ -3,185 +3,71 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Factory Voice AI - Complete System</title>
+    <title>Factory STT/TTS - Real-time Speech Recognition</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
     <div class="container">
-        <!-- Header -->
         <header>
-            <div class="header-content">
-                <h1>🏭 Factory Voice AI</h1>
-                <p class="subtitle">Industrial STT/TTS System with Multi-Language Support</p>
-            </div>
-            <div class="header-status">
-                <div class="status-badge" id="systemStatus">
+            <h1>🎤 Factory STT/TTS</h1>
+            <div class="status-section">
+                <div id="systemStatus" class="status-badge ready">
                     <span class="status-dot"></span>
                     <span>Initializing...</span>
                 </div>
             </div>
         </header>
 
-        <div class="main-layout">
-            <!-- Left Panel: Controls & Settings -->
-            <aside class="sidebar">
-                <!-- Connection Status -->
-                <div class="panel">
-                    <h3>🔌 Connection</h3>
-                    <div class="connection-status" id="connectionStatus">
-                        <span class="connection-dot"></span>
-                        <span>Disconnected</span>
-                    </div>
-                </div>
-
-                <!-- Language Selection -->
-                <div class="panel">
-                    <h3>🌐 Language</h3>
-                    <div class="language-selector">
-                        <button class="lang-btn active" data-lang="auto" id="langAuto">
-                            <span>🌍</span> Auto
-                        </button>
-                        <button class="lang-btn" data-lang="en" id="langEn">
-                            <span>🇺🇸</span> English
-                        </button>
-                        <button class="lang-btn" data-lang="ja" id="langJa">
-                            <span>🇯🇵</span> 日本語
-                        </button>
-                        <button class="lang-btn" data-lang="zh" id="langZh">
-                            <span>🇨🇳</span> 中文
-                        </button>
-                    </div>
-                    <div class="detected-lang" id="detectedLang">
-                        <small>Detected: <span id="detectedLangText">-</span></small>
-                    </div>
-                </div>
-
-                <!-- Audio Controls -->
-                <div class="panel">
-                    <h3>🎤 Audio Controls</h3>
-                    <div class="controls-grid">
-                        <button id="startBtn" class="btn btn-primary btn-large">
-                            <span class="btn-icon">🎤</span>
-                            Start Listening
-                        </button>
-                        <button id="stopBtn" class="btn btn-secondary btn-large" disabled>
-                            <span class="btn-icon">⏹</span>
-                            Stop
-                        </button>
-                        <button id="saveRecordingBtn" class="btn btn-info" disabled>
-                            <span class="btn-icon">💾</span>
-                            Save Recording
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Audio Level Meter -->
-                <div class="panel">
-                    <h3>📊 Audio Level</h3>
-                    <div class="audio-meter-container">
-                        <div class="audio-meter">
-                            <div class="audio-meter-bar" id="audioMeterBar"></div>
-                        </div>
-                        <div class="audio-level-text" id="audioLevelText">-∞ dB</div>
-                    </div>
-                </div>
-
-                <!-- System Status Indicators -->
-                <div class="panel">
-                    <h3>⚙️ System Status</h3>
-                    <div class="status-grid">
-                        <div class="status-item">
-                            <span class="status-label">Audio Pipeline</span>
-                            <span class="status-value" id="pipelineStatus">Ready</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">STT Engine</span>
-                            <span class="status-value" id="sttStatus">Not Connected</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">TTS Engine</span>
-                            <span class="status-value" id="ttsStatus">Not Connected</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="status-label">VAD</span>
-                            <span class="status-value" id="vadStatus">Active</span>
-                        </div>
-                    </div>
-                </div>
-
-            </aside>
-
-            <!-- Main Content: Conversation Area -->
-            <main class="main-content">
-                <!-- Visual Status Indicator -->
-                <div class="visual-status" id="visualStatus">
-                    <div class="status-circle" id="statusCircle">
-                        <div class="status-icon" id="statusIcon">🎤</div>
-                        <div class="status-text" id="statusText">Ready</div>
-                    </div>
-                    <div class="status-waves" id="statusWaves"></div>
-                </div>
-
-                <!-- Real-time Transcription -->
-                <div class="transcription-panel">
-                    <div class="transcription-header">
-                        <h3>📝 Live Transcription</h3>
-                        <div class="transcription-status" id="transcriptionStatus">
-                            <span class="status-dot"></span>
-                            <span>Waiting...</span>
-                        </div>
-                    </div>
-                    <div class="transcription-content" id="transcriptionContent">
-                        <p class="transcription-placeholder">Speak to see transcription here...</p>
-                    </div>
-                    <div class="transcription-interim" id="transcriptionInterim"></div>
-                </div>
-
-                <!-- TTS Output Panel -->
-                <div class="tts-panel" id="ttsPanel" style="display: none;">
-                    <div class="tts-header">
-                        <h3>🔊 System Response</h3>
-                        <button class="btn-icon-only" id="stopTTSBtn" title="Stop speaking">
-                            ⏹
-                        </button>
-                    </div>
-                    <div class="tts-content" id="ttsContent">
-                        <!-- TTS text will appear here -->
-                    </div>
-                    <div class="tts-visualizer" id="ttsVisualizer">
-                        <div class="tts-wave"></div>
-                    </div>
-                </div>
-
-                <!-- Processing Log -->
-                <div class="log-panel collapsible">
-                    <h3 class="collapsible-header" onclick="togglePanel(this)">
-                        📋 Processing Log
-                        <span class="toggle-icon">▼</span>
-                    </h3>
-                    <div class="collapsible-content">
-                        <div class="log-content" id="logContent">
-                            <div class="log-entry">System initialized. Ready to process audio.</div>
-                        </div>
-                    </div>
-                </div>
-            </main>
-        </div>
-    </div>
-
-    <!-- Help Modal -->
-    <div class="modal" id="helpModal" style="display: none;">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>📋 Help & Troubleshooting</h2>
-                <button class="btn-icon-only" onclick="closeModal('helpModal')">✕</button>
+        <main>
+            <div class="controls">
+                <button id="startBtn" class="btn btn-primary">Start Recording</button>
+                <button id="stopBtn" class="btn btn-secondary" disabled>Stop Recording</button>
+                <button id="saveBtn" class="btn btn-secondary" disabled>Save Recording</button>
             </div>
-            <div class="modal-body">
-                <div id="helpContent">
-                    <!-- Help content will be dynamically loaded -->
+
+            <div class="transcription-container">
+                <div id="transcriptionArea" class="transcription-area">
+                    <div class="welcome-message">
+                        <p>Click "Start Recording" to begin real-time transcription</p>
+                        <p class="hint">⚠️ Make sure to:</p>
+                        <ul class="hint-list">
+                            <li>Allow microphone access when prompted by your browser</li>
+                            <li>Use HTTPS (required for microphone access)</li>
+                            <li>Check browser settings if permission was previously denied</li>
+                        </ul>
+                    </div>
                 </div>
             </div>
-        </div>
+
+            <div class="metrics">
+                <div class="metric-item">
+                    <span class="metric-label">VAD Status:</span>
+                    <div class="vad-indicator">
+                        <span id="vadDot" class="vad-dot"></span>
+                        <span id="vadStatus" class="metric-value">No Speech</span>
+                    </div>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Audio Level:</span>
+                    <span id="audioLevel" class="metric-value">-∞ dB</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">VAD Probability:</span>
+                    <span id="vadProbability" class="metric-value">0.000</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Speech State:</span>
+                    <span id="speechState" class="metric-value">silence</span>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <div class="log-container">
+                <div id="logArea" class="log-area"></div>
+            </div>
+        </footer>
     </div>
 
     <script src="/static/app.js"></script>

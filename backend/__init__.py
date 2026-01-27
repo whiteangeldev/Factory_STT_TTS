@@ -1,1 +1,1 @@
-"""Backend package for Factory STT/TTS system"""
+# Backend package
