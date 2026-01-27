@@ -6,9 +6,10 @@ class STTApp {
         this.mediaStream = null;
         this.processor = null;
         this.isRecording = false;
-        this.isStopping = false;  // Flag to prevent sending chunks during stop
+        this.isStopping = false;
         this.audioChunks = [];
         this.transcriptionBuffer = [];
+        this.inputMode = 'microphone'; // 'microphone' or 'system'
         
         this.init();
     }
@@ -80,6 +81,27 @@ class STTApp {
         });
         
         this.socket.on('processed_audio', (data) => {
+            // Log first few events to verify reception
+            if (!this._processedAudioCount) {
+                this._processedAudioCount = 0;
+            }
+            this._processedAudioCount++;
+            
+            if (this._processedAudioCount <= 5) {
+                console.log(`📥 [${this._processedAudioCount}] Received processed_audio:`, {
+                    has_audio: !!data.audio,
+                    audio_length: data.audio ? data.audio.length : 0,
+                    has_speech: data.has_speech,
+                    audio_level_db: data.audio_level_db,
+                    mode: this.inputMode,
+                    isRecording: this.isRecording,
+                    current_chunks: this.audioChunks.length
+                });
+            } else if (this._processedAudioCount % 100 === 0) {
+                // Log every 100th chunk to show progress
+                console.log(`📥 Received ${this._processedAudioCount} audio chunks (${this.audioChunks.length} stored)`);
+            }
+            
             // Debug: log VAD data occasionally
             if (data.has_speech) {
                 console.log('🎤 VAD: Speech detected', data);
@@ -130,6 +152,15 @@ class STTApp {
         document.getElementById('startBtn').addEventListener('click', () => this.startRecording());
         document.getElementById('stopBtn').addEventListener('click', () => this.stopRecording());
         document.getElementById('saveBtn').addEventListener('click', () => this.saveRecording());
+        document.getElementById('inputMode').addEventListener('change', (e) => {
+            const oldMode = this.inputMode;
+            this.inputMode = e.target.value;
+            if (this.isRecording) {
+                this.log('Please stop recording before changing input mode', 'warning');
+                e.target.value = oldMode;
+                this.inputMode = oldMode;
+            }
+        });
     }
     
     async startRecording() {
@@ -145,9 +176,9 @@ class STTApp {
             }
         }
         
-        // Check if getUserMedia is available
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            const errorMsg = 'Microphone access is not available in this browser. Please use a modern browser (Chrome, Firefox, Edge).';
+        // Check if mediaDevices API is available
+        if (!navigator.mediaDevices) {
+            const errorMsg = 'Media access is not available in this browser. Please use a modern browser (Chrome, Firefox, Edge).';
             console.error(errorMsg);
             this.log(errorMsg, 'error');
             alert(errorMsg);
@@ -168,38 +199,94 @@ class STTApp {
             console.log(`AudioContext created with sample rate: ${actualSampleRate} Hz`);
             this.log(`Audio context: ${actualSampleRate} Hz`, 'info');
             
-            // Request microphone access with flexible constraints
-            console.log('Requesting microphone access...');
-            this.log('Requesting microphone permission...', 'info');
+            // Get input mode
+            const modeSelect = document.getElementById('inputMode');
+            this.inputMode = modeSelect ? modeSelect.value : 'microphone';
             
             let stream;
-            try {
-                // First try with ideal constraints
-                stream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        channelCount: { ideal: 1 },
-                        sampleRate: { ideal: 16000 },
-                        echoCancellation: { ideal: true },
-                        noiseSuppression: { ideal: true },
-                        autoGainControl: { ideal: true }
-                    }
-                });
-            } catch (err) {
-                console.warn('Failed with ideal constraints, trying basic constraints:', err);
-                // Fallback to basic constraints
-                stream = await navigator.mediaDevices.getUserMedia({
-                    audio: true
-                });
+            if (this.inputMode === 'system') {
+                // System audio: Use server-side capture (no browser permissions needed)
+                console.log('Using server-side system audio capture');
+                this.log('Starting server-side system audio capture...', 'info');
+                
+                // No browser audio capture needed - server handles it
+                this.mediaStream = null;
+                this.isRecording = true;
+                this.isStopping = false;
+                this.audioChunks = [];
+                this.transcriptionBuffer = [];
+                
+                // Reset counters for logging
+                this._processedAudioCount = 0;
+                this._silenceChunkCount = 0;
+                
+                console.log('🎙️ System audio mode: Ready to receive audio from server');
+                console.log('   Waiting for processed_audio events...');
+                
+                // Clear transcription area
+                const area = document.getElementById('transcriptionArea');
+                area.innerHTML = '';
+                
+                // Notify backend to start server-side capture
+                if (this.socket && this.socket.connected) {
+                    this.socket.emit('start_recording', {
+                        input_mode: 'system',
+                        server_capture: true
+                    });
+                }
+                
+                // Update UI
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                document.getElementById('saveBtn').disabled = false;
+                
+                this.updateSystemStatus('listening', 'Listening (system audio)...');
+                this.log('System audio started - capturing from server (no browser permissions needed)', 'success');
+                return;  // Exit early - no browser audio setup needed
+            } else {
+                // Request microphone access
+                if (!navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Microphone access is not available in this browser.');
+                }
+                
+                console.log('Requesting microphone access...');
+                this.log('Requesting microphone permission...', 'info');
+                
+                try {
+                    // First try with ideal constraints
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            channelCount: { ideal: 1 },
+                            sampleRate: { ideal: 16000 },
+                            echoCancellation: { ideal: true },
+                            noiseSuppression: { ideal: true },
+                            autoGainControl: { ideal: true }
+                        }
+                    });
+                } catch (err) {
+                    console.warn('Failed with ideal constraints, trying basic constraints:', err);
+                    // Fallback to basic constraints
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: true
+                    });
+                }
+                
+                console.log('Microphone access granted');
+                this.log('Microphone access granted', 'success');
             }
             
-            console.log('Microphone access granted');
-            this.log('Microphone access granted', 'success');
-            
             // Get actual audio track settings
-            const audioTrack = stream.getAudioTracks()[0];
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks.length === 0) {
+                throw new Error('No audio track available. Please check your input source.');
+            }
+            
+            const audioTrack = audioTracks[0];
             const settings = audioTrack.getSettings();
             console.log('Audio track settings:', settings);
-            this.log(`Audio: ${settings.sampleRate || 'unknown'} Hz, ${settings.channelCount || 'unknown'} channels`, 'info');
+            
+            const sourceType = this.inputMode === 'system' ? 'System Audio' : 'Microphone';
+            this.log(`${sourceType}: ${settings.sampleRate || 'unknown'} Hz, ${settings.channelCount || 'unknown'} channels`, 'info');
             
             this.mediaStream = stream;
             this.isRecording = true;
@@ -257,7 +344,10 @@ class STTApp {
             
             // Notify backend that recording has started
             if (this.socket && this.socket.connected) {
-                this.socket.emit('start_recording');
+                this.socket.emit('start_recording', {
+                    input_mode: this.inputMode,
+                    server_capture: false
+                });
             }
             
             // Update UI
@@ -281,9 +371,12 @@ class STTApp {
                 errorMsg += 'No microphone found. Please connect a microphone and try again.';
             } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
                 errorMsg += 'Microphone is being used by another application. Please close other apps and try again.';
+            } else if (error.name === 'NotSupportedError') {
+                errorMsg += 'Microphone access is not supported in this browser.';
+            } else if (error.name === 'AbortError') {
+                errorMsg += 'Microphone request was cancelled.';
             } else if (error.name === 'OverconstrainedError') {
                 errorMsg += 'Microphone does not support required settings. Trying with basic settings...';
-                // Could retry with basic constraints here
             } else {
                 errorMsg += `Error: ${error.message || error.name}`;
             }
@@ -347,7 +440,21 @@ class STTApp {
         document.getElementById('stopBtn').disabled = true;
         
         this.updateSystemStatus('ready', 'Ready');
-        this.log(`Recording stopped: ${this.audioChunks.length} chunks buffered`, 'info');
+        
+        // Log summary of received audio
+        const totalSamples = this.audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const duration = (totalSamples / 16000).toFixed(2);
+        const totalReceived = this._processedAudioCount || 0;
+        
+        console.log('🛑 Recording stopped - Summary:');
+        console.log(`   Total processed_audio events received: ${totalReceived}`);
+        console.log(`   Audio chunks stored: ${this.audioChunks.length}`);
+        console.log(`   Total samples: ${totalSamples} (${duration}s at 16kHz)`);
+        if (this.inputMode === 'system') {
+            console.log(`   Silence chunks (no audio data): ${this._silenceChunkCount || 0}`);
+        }
+        
+        this.log(`Recording stopped: ${this.audioChunks.length} chunks buffered (${duration}s)`, 'info');
         
         // Reset stopping flag after a short delay to allow any pending callbacks to finish
         setTimeout(() => {
@@ -356,8 +463,8 @@ class STTApp {
     }
     
     processAudioChunk(audioData, sourceSampleRate = 16000) {
-        // Only process if recording and not stopping
-        if (!this.isRecording || this.isStopping) {
+        // Only process if recording and not stopping, and not in system audio mode
+        if (!this.isRecording || this.isStopping || this.inputMode === 'system') {
             return;
         }
         
@@ -470,6 +577,103 @@ class STTApp {
     }
     
     handleProcessedAudio(data) {
+        // Store audio chunks for saving (in system audio mode, audio comes from server)
+        if (this.isRecording && this.inputMode === 'system') {
+            // Debug: Log first few to verify storage is attempted
+            if (!this._storageAttemptCount) {
+                this._storageAttemptCount = 0;
+            }
+            this._storageAttemptCount++;
+            if (this._storageAttemptCount <= 3) {
+                console.log(`💾 [Storage Attempt ${this._storageAttemptCount}] isRecording=${this.isRecording}, inputMode=${this.inputMode}, has_audio=${!!data.audio}`);
+            }
+            
+            // Always try to store audio chunks, even if they're silence
+            if (!data.audio || data.audio === '') {
+                // Create silence chunk if no audio data (shouldn't happen, but handle gracefully)
+                if (!this._silenceChunkCount) this._silenceChunkCount = 0;
+                this._silenceChunkCount++;
+                if (this._silenceChunkCount <= 3) {
+                    console.warn(`⚠️ [${this._silenceChunkCount}] Received processed_audio with NO audio data - creating silence chunk`);
+                }
+                // Create a silence chunk to maintain recording continuity
+                const silenceChunk = new Float32Array(480); // 30ms at 16kHz
+                this.audioChunks.push(silenceChunk);
+                if (this._storageAttemptCount <= 3) {
+                    console.log(`💾 Stored silence chunk, total chunks: ${this.audioChunks.length}`);
+                }
+                return;
+            }
+            
+            try {
+                // Decode base64 audio to binary string
+                const audioBytes = atob(data.audio);
+                
+                if (audioBytes.length === 0) {
+                    console.warn('⚠️ Decoded audio bytes are empty, creating silence chunk');
+                    const silenceChunk = new Float32Array(480);
+                    this.audioChunks.push(silenceChunk);
+                    return;
+                }
+                
+                // Create ArrayBuffer and DataView for proper byte handling
+                const buffer = new ArrayBuffer(audioBytes.length);
+                const uint8View = new Uint8Array(buffer);
+                for (let i = 0; i < audioBytes.length; i++) {
+                    uint8View[i] = audioBytes.charCodeAt(i);
+                }
+                
+                // Create Int16Array from the buffer
+                const audioArray = new Int16Array(buffer);
+                
+                if (audioArray.length === 0) {
+                    console.warn('⚠️ Audio array is empty, creating silence chunk');
+                    const silenceChunk = new Float32Array(480);
+                    this.audioChunks.push(silenceChunk);
+                    return;
+                }
+                
+                // Check audio level
+                const maxSample = Math.max(...Array.from(audioArray).map(Math.abs));
+                const audioLevel = maxSample / 32768.0;
+                
+                // Convert Int16Array to Float32Array (normalize to [-1, 1])
+                const float32Audio = new Float32Array(audioArray.length);
+                for (let i = 0; i < audioArray.length; i++) {
+                    float32Audio[i] = audioArray[i] / 32768.0;
+                }
+                
+                // Store for saving (always store, even if silence)
+                this.audioChunks.push(float32Audio);
+                
+                // Log first few chunks to confirm storage is working
+                if (this.audioChunks.length <= 5) {
+                    console.log(`💾 [${this.audioChunks.length}] Stored audio chunk: ${float32Audio.length} samples, level=${audioLevel.toFixed(4)} (${(20 * Math.log10(audioLevel + 1e-10)).toFixed(1)} dB)`);
+                } else if (this.audioChunks.length % 100 === 0) {
+                    // Log every 100th stored chunk
+                    const totalSamples = this.audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+                    const duration = (totalSamples / 16000).toFixed(2);
+                    console.log(`💾 Stored ${this.audioChunks.length} chunks (${duration}s of audio)`);
+                }
+            } catch (error) {
+                console.error('❌ Error storing audio chunk:', error);
+                console.error('  Audio data length:', data.audio ? data.audio.length : 'null');
+                // Create silence chunk on error to maintain continuity
+                const silenceChunk = new Float32Array(480);
+                this.audioChunks.push(silenceChunk);
+                console.log(`💾 Stored silence chunk after error, total chunks: ${this.audioChunks.length}`);
+            }
+        } else {
+            // Debug: Log why chunks aren't being stored
+            if (this.inputMode === 'system' && !this.isRecording) {
+                if (!this._notRecordingCount) this._notRecordingCount = 0;
+                this._notRecordingCount++;
+                if (this._notRecordingCount <= 3) {
+                    console.warn(`⚠️ [${this._notRecordingCount}] Not storing chunk: isRecording=${this.isRecording}, inputMode=${this.inputMode}`);
+                }
+            }
+        }
+        
         // Update VAD indicator (green dot in metrics)
         const vadDot = document.getElementById('vadDot');
         const vadStatus = document.getElementById('vadStatus');
@@ -611,19 +815,47 @@ class STTApp {
     
     async saveRecording() {
         if (this.audioChunks.length === 0) {
-            alert('No audio recorded');
+            alert('No audio recorded. Please start recording first.');
             return;
         }
+        
+        console.log(`💾 Saving recording: ${this.audioChunks.length} chunks`);
         
         try {
             // Combine all audio chunks
             const totalLength = this.audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            
+            if (totalLength === 0) {
+                alert('No audio data to save. The recording may be empty.');
+                return;
+            }
+            
             const combinedAudio = new Float32Array(totalLength);
             let offset = 0;
             
             for (const chunk of this.audioChunks) {
-                combinedAudio.set(chunk, offset);
-                offset += chunk.length;
+                if (chunk && chunk.length > 0) {
+                    combinedAudio.set(chunk, offset);
+                    offset += chunk.length;
+                }
+            }
+            
+            const duration = (totalLength / 16000).toFixed(2);
+            console.log(`💾 Combined audio: ${totalLength} samples (${duration}s at 16kHz)`);
+            
+            // Check if audio is all silence (calculate max without spreading to avoid stack overflow)
+            let maxLevel = 0;
+            for (let i = 0; i < combinedAudio.length; i++) {
+                const abs = Math.abs(combinedAudio[i]);
+                if (abs > maxLevel) {
+                    maxLevel = abs;
+                }
+            }
+            if (maxLevel < 0.001) {
+                console.warn('⚠️ Warning: Recording appears to be silence (audio level < 0.001)');
+                if (!confirm('The recording appears to be silence. Save anyway?')) {
+                    return;
+                }
             }
             
             // Convert to WAV
@@ -631,18 +863,27 @@ class STTApp {
             const blob = new Blob([wav], { type: 'audio/wav' });
             const url = URL.createObjectURL(blob);
             
+            // Generate filename with timestamp and mode
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const mode = this.inputMode === 'system' ? 'system' : 'mic';
+            const filename = `recording_${mode}_${timestamp}.wav`;
+            
             // Download
             const a = document.createElement('a');
             a.href = url;
-            a.download = `recording_${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+            a.download = filename;
+            document.body.appendChild(a);
             a.click();
+            document.body.removeChild(a);
             
             URL.revokeObjectURL(url);
-            this.log('Recording saved', 'success');
+            this.log(`Recording saved: ${filename} (${duration}s)`, 'success');
+            console.log(`✅ Successfully saved: ${filename}`);
             
         } catch (error) {
-            console.error('Error saving recording:', error);
-            alert(`Failed to save recording: ${error.message}`);
+            console.error('❌ Error saving recording:', error);
+            console.error('  Stack:', error.stack);
+            alert(`Failed to save recording: ${error.message}\n\nCheck console for details.`);
         }
     }
     

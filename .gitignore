@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+AI_meeting_analyzer_AssemblyAI/
 develop-eggs/
 dist/
 downloads/

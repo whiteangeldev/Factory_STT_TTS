@@ -21,6 +21,13 @@
 
         <main>
             <div class="controls">
+                <div class="mode-selector">
+                    <label>Input Mode:</label>
+                    <select id="inputMode" class="mode-select">
+                        <option value="microphone">Microphone</option>
+                        <option value="system">System Audio</option>
+                    </select>
+                </div>
                 <button id="startBtn" class="btn btn-primary">Start Recording</button>
                 <button id="stopBtn" class="btn btn-secondary" disabled>Stop Recording</button>
                 <button id="saveBtn" class="btn btn-secondary" disabled>Save Recording</button>
@@ -30,11 +37,16 @@
                 <div id="transcriptionArea" class="transcription-area">
                     <div class="welcome-message">
                         <p>Click "Start Recording" to begin real-time transcription</p>
+                        <p class="hint">📌 Input Modes:</p>
+                        <ul class="hint-list">
+                            <li><strong>Microphone:</strong> Records from your microphone</li>
+                            <li><strong>System Audio:</strong> Captures system audio (no browser permissions needed!)</li>
+                        </ul>
                         <p class="hint">⚠️ Make sure to:</p>
                         <ul class="hint-list">
-                            <li>Allow microphone access when prompted by your browser</li>
+                            <li>For microphone: Allow audio access when prompted</li>
+                            <li>For system audio: Install <code>sounddevice</code> on server</li>
                             <li>Use HTTPS (required for microphone access)</li>
-                            <li>Check browser settings if permission was previously denied</li>
                         </ul>
                     </div>
                 </div>
