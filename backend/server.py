@@ -1,235 +1,539 @@
-"""FastAPI server with WebSocket support for real-time audio processing"""
+"""Flask-SocketIO server for real-time STT/TTS"""
+import eventlet
+eventlet.monkey_patch()
+
 import base64
-import json
 import logging
-import os
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
-import uvicorn
+from flask import Flask, send_from_directory, request
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+import os
+import ssl
 
-from backend.audio.pipeline import AudioPipeline, SpeechState
-from backend.config import AudioConfig
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    logger_env = logging.getLogger(__name__)
+    logger_env.info("Loaded environment variables from .env file (if present)")
+except ImportError:
+    # python-dotenv not installed, skip loading .env
+    pass
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from .config import AudioConfig
+from .audio.pipeline import AudioPipeline
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Factory STT/TTS Server")
+# Suppress SSL errors from eventlet (browsers rejecting self-signed certs)
+# These are harmless - browsers reject certs but Socket.IO connections still work
+import warnings
+import sys
+import io
+warnings.filterwarnings('ignore', category=UserWarning)
 
-# Initialize audio pipeline
+# Suppress eventlet SSL error logging
+logging.getLogger('eventlet').setLevel(logging.ERROR)
+logging.getLogger('eventlet.wsgi').setLevel(logging.ERROR)
+logging.getLogger('eventlet.hubs').setLevel(logging.ERROR)
+
+# Suppress SSL errors in stderr (they're just browsers rejecting self-signed certs)
+class SSLFilter:
+    """Filter out SSL certificate errors from logs"""
+    def filter(self, record):
+        # Filter out SSL certificate unknown errors
+        if 'SSLV3_ALERT_CERTIFICATE_UNKNOWN' in str(record.getMessage()):
+            return False
+        if 'ssl.SSLError' in str(record.getMessage()) and 'certificate' in str(record.getMessage()).lower():
+            return False
+        return True
+
+# Add filter to root logger
+logging.getLogger().addFilter(SSLFilter())
+
+# Intercept stderr to filter SSL certificate error tracebacks
+# These happen when browsers reject self-signed certs during HTTP handshake
+# but Socket.IO WebSocket connections still work fine
+_original_stderr = sys.stderr
+_ssl_error_active = False
+
+class FilteredStderr:
+    """Filter stderr to suppress SSL certificate error tracebacks"""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+    
+    def write(self, text):
+        global _ssl_error_active
+        text_str = str(text)
+        
+        # Detect SSL certificate error
+        if 'SSLV3_ALERT_CERTIFICATE_UNKNOWN' in text_str:
+            _ssl_error_active = True
+            return  # Suppress
+        
+        # If we're in an SSL error traceback, suppress traceback lines
+        if _ssl_error_active:
+            # Suppress traceback lines (File, Traceback, etc.)
+            if (text_str.strip().startswith('Traceback') or
+                text_str.strip().startswith('File ') or
+                'eventlet' in text_str.lower() or
+                'ssl.SSLError' in text_str or
+                'Removing descriptor' in text_str or
+                not text_str.strip()):
+                return  # Suppress
+            # If we see a normal log line (starts with timestamp or our logger format), reset
+            if ' - ' in text_str and ('INFO' in text_str or 'ERROR' in text_str or 'WARNING' in text_str):
+                _ssl_error_active = False
+                # Write this line (it's a real log)
+                self.original_stderr.write(text)
+            else:
+                return  # Still in traceback, suppress
+        
+        # Normal output
+        self.original_stderr.write(text)
+    
+    def flush(self):
+        self.original_stderr.flush()
+    
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
+
+# Replace stderr with filtered version (only suppress SSL cert errors)
+# Note: This suppresses harmless SSL cert rejection errors from browsers
+# The Socket.IO WebSocket connections still work fine
+sys.stderr = FilteredStderr(_original_stderr)
+
+# Initialize Flask app
+app = Flask(__name__, static_folder='../frontend/static', template_folder='../frontend')
+app.config['SECRET_KEY'] = 'factory-stt-tts-secret-key'
+CORS(app)
+
+# Initialize SocketIO
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    logger=False,
+    engineio_logger=False
+)
+
+# Global state
 config = AudioConfig()
-active_connections = []
+connected_clients = set()
 
-# Store speech events per connection
-connection_queues = {}
+# Per-client pipelines and state
+client_pipelines = {}  # {client_id: AudioPipeline} - One pipeline per client
+client_audio_buffers = {}  # {client_id: np.ndarray}
+client_recording_state = {}  # {client_id: bool} - Track if client is recording
+MIN_CHUNK_SIZE_FOR_VAD = 480  # 30ms at 16kHz
+MIN_AUDIO_LEVEL_FOR_VAD = 0.0005  # Minimum audio level to consider for VAD (very low threshold - only filter out complete silence)
 
 def speech_event_callback(event_type: str, data: dict):
-    """Handle speech events from pipeline - store for websocket delivery"""
-    logger.info(f"Speech event: {event_type}")
-    # Store event to be sent to all active connections
-    event_data = {
-        "type": "speech_event",
-        "event": event_type,
-        "data": {k: v for k, v in data.items() if k != "audio_segment"}
-    }
-    # Add to each connection's queue
-    for ws in active_connections:
-        if ws not in connection_queues:
-            connection_queues[ws] = []
-        connection_queues[ws].append(event_data)
+    """Callback for speech events from pipeline"""
+    logger.info(f"🔔 Speech event callback: {event_type}, data keys: {list(data.keys())}")
+    
+    if event_type == "transcription":
+        event_data = {
+            "text": data.get("text", ""),
+            "language": data.get("language"),
+            "confidence": float(data.get("confidence", 0.0)),
+            "is_final": True
+        }
+        try:
+            socketio.emit("transcription", event_data, namespace="/")
+            logger.info(f"📝 ✅ Emitted transcription: '{event_data['text'][:50]}...'")
+        except Exception as e:
+            logger.error(f"❌ Error emitting transcription: {e}")
+        return
+    
+    elif event_type == "transcription_interim":
+        event_data = {
+            "text": data.get("text", ""),
+            "language": data.get("language"),
+            "confidence": float(data.get("confidence", 0.0)),
+            "is_final": False
+        }
+        try:
+            socketio.emit("transcription_interim", event_data, namespace="/")
+            logger.info(f"📝 ✅ Emitted transcription_interim: '{event_data['text'][:50]}...'")
+        except Exception as e:
+            logger.error(f"❌ Error emitting transcription_interim: {e}")
+        return
+    
+    elif event_type == "transcription_processing":
+        event_data = {
+            "status": data.get("status", "processing"),
+            "audio_duration": float(data.get("audio_duration", 0.0)),
+            "error": data.get("error")
+        }
+        try:
+            socketio.emit("transcription_processing", event_data, namespace="/")
+            logger.info(f"📝 ✅ Emitted transcription_processing: {event_data['status']}")
+        except Exception as e:
+            logger.error(f"❌ Error emitting transcription_processing: {e}")
+        return
+    
+    else:
+        # Generic speech event
+        event_data = {
+            "type": "speech_event",
+            "event": event_type,
+            "data": {k: v for k, v in data.items() if k != "audio_segment"}
+        }
+        try:
+            socketio.emit("speech_event", event_data, namespace="/")
+            logger.info(f"🔊 ✅ Emitted speech_event: {event_type}")
+        except Exception as e:
+            logger.error(f"❌ Error emitting speech_event: {e}")
 
-audio_pipeline = AudioPipeline(config, event_callback=speech_event_callback)
+# Pipelines are created per-client (see handle_connect and handle_start_recording)
 
-@app.get("/")
-async def get_index():
-    """Serve the frontend HTML"""
-    with open("frontend/index.html", "r") as f:
-        return HTMLResponse(content=f.read())
+@app.route('/')
+def index():
+    """Serve main page"""
+    frontend_dir = os.path.join(os.path.dirname(__file__), '../frontend')
+    return send_from_directory(frontend_dir, 'index.html')
 
-@app.websocket("/ws/audio")
-async def websocket_audio(websocket: WebSocket):
-    await websocket.accept()
-    websocket.client_state = "open"  # Track connection state
-    active_connections.append(websocket)
-    connection_queues[websocket] = []  # Initialize queue for this connection
-    logger.info(f"New WebSocket connection established (total: {len(active_connections)})")
+@app.route('/static/<path:path>')
+def serve_static(path):
+    """Serve static files"""
+    static_dir = os.path.join(os.path.dirname(__file__), '../frontend/static')
+    return send_from_directory(static_dir, path)
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    client_id = request.sid
+    connected_clients.add(client_id)
+    client_audio_buffers[client_id] = np.array([], dtype=np.float32)  # Initialize buffer
+    client_recording_state[client_id] = False  # Not recording initially
+    # Pipeline will be created when recording starts
+    logger.info(f"✅ Client connected: {client_id} (total: {len(connected_clients)})")
+    
+    emit('connected', {
+        'status': 'ready',
+        'message': 'WebSocket ready - VAD and noise reduction active'
+    })
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    client_id = request.sid
+    connected_clients.discard(client_id)
+    client_audio_buffers.pop(client_id, None)  # Clean up buffer
+    client_recording_state.pop(client_id, None)  # Clean up recording state
+    client_pipelines.pop(client_id, None)  # Clean up pipeline
+    logger.info(f"🔌 Client disconnected: {client_id} (remaining: {len(connected_clients)})")
+
+@socketio.on('start_recording')
+def handle_start_recording(data=None):
+    """Handle recording start"""
+    client_id = request.sid
+    client_recording_state[client_id] = True
+    client_audio_buffers[client_id] = np.array([], dtype=np.float32)  # Clear buffer on start
+    
+    # Create a fresh pipeline instance for this client
+    # This ensures clean state for each recording session
+    client_pipelines[client_id] = AudioPipeline(config, event_callback=speech_event_callback)
+    client_pipelines[client_id].reset()  # Ensure clean state
+    logger.info(f"🎙️ Recording started for client: {client_id} - new pipeline created and reset")
+    
+    emit('recording_status', {
+        'is_recording': True,
+        'status': 'Recording...'
+    })
+
+@socketio.on('stop_recording')
+def handle_stop_recording(data=None):
+    """Handle recording stop"""
+    client_id = request.sid
+    
+    # Set recording state to False IMMEDIATELY to stop processing any incoming chunks
+    client_recording_state[client_id] = False
+    
+    # Clear audio buffer to discard any pending audio
+    client_audio_buffers[client_id] = np.array([], dtype=np.float32)
+    
+    # Remove pipeline for this client (will be recreated on next start)
+    client_pipelines.pop(client_id, None)
+    
+    logger.info(f"🛑 Recording stopped for client: {client_id} - pipeline removed, audio processing disabled")
+    
+    emit('recording_status', {
+        'is_recording': False,
+        'status': 'Ready'
+    })
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    """Handle incoming audio chunk - only process if client is recording"""
+    client_id = request.sid
+    
+    # Only process audio if client is recording
+    if not client_recording_state.get(client_id, False):
+        # Silently ignore audio chunks when not recording
+        # Log occasionally to detect if chunks are still arriving after stop
+        if not hasattr(handle_audio_chunk, '_ignored_count'):
+            handle_audio_chunk._ignored_count = {}
+        if client_id not in handle_audio_chunk._ignored_count:
+            handle_audio_chunk._ignored_count[client_id] = 0
+        handle_audio_chunk._ignored_count[client_id] += 1
+        if handle_audio_chunk._ignored_count[client_id] <= 3:
+            logger.warning(f"⚠️ Ignoring audio chunk from client {client_id} - not recording (chunk #{handle_audio_chunk._ignored_count[client_id]})")
+        return
+    
+    # Reset ignored count when recording is active
+    if hasattr(handle_audio_chunk, '_ignored_count'):
+        handle_audio_chunk._ignored_count.pop(client_id, None)
     
     try:
-        while True:
-            try:
-                data = await websocket.receive_text()
-                msg = json.loads(data)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Invalid JSON received: {e}")
-                continue
-            except Exception as e:
-                logger.error(f"Error receiving message: {e}")
-                break
-            
-            msg_type = msg.get("type")
-            
-            if msg_type == "audio_chunk":
-                # Decode and process audio
-                audio_bytes = base64.b64decode(msg.get("audio"))
-                audio_float = (np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0)
-                
-                # Optional reference audio for AEC
-                reference_audio = None
-                if msg.get("reference_audio"):
-                    ref_bytes = base64.b64decode(msg.get("reference_audio"))
-                    reference_audio = (np.frombuffer(ref_bytes, dtype=np.int16).astype(np.float32) / 32768.0)
-                
-                import time
-                chunk_start_time = time.time()
-                
-                processed = audio_pipeline.process_chunk(audio_float, reference_audio=reference_audio)
-                
-                processing_time = (time.time() - chunk_start_time) * 1000  # Convert to ms
-                
-                # Get VAD probability and metrics (stored by pipeline)
-                vad_prob = getattr(audio_pipeline, '_last_vad_prob', 0.0)
-                audio_metrics = getattr(audio_pipeline, '_last_audio_metrics', {})
-                
-                # Get current speech state
-                speech_state = audio_pipeline.speech_state.value
-                
-                # Calculate input audio level
-                audio_rms = np.sqrt(np.mean(audio_float ** 2))
-                input_db = 20 * np.log10(audio_rms) if audio_rms > 0 else -float('inf')
-                
-                # Get processing metrics from pipeline
-                input_db_metric = audio_metrics.get('input_db', input_db)
-                denoised_db = audio_metrics.get('denoised_db', input_db)
-                normalized_db = audio_metrics.get('normalized_db', input_db)
-                ns_improvement = audio_metrics.get('ns_improvement', 0.0)
-                gate_passed = audio_metrics.get('gate_passed', True)
-                vad_reason = audio_metrics.get('vad_reason', 'UNKNOWN')
-                
-                # Determine VAD decision
-                is_speech = vad_prob > 0.5
-                vad_decision = "SPEECH" if is_speech else "NOISE"
-                
-                # Calculate output level if processed
-                if processed is not None:
-                    output_rms = np.sqrt(np.mean(processed ** 2))
-                    output_db = 20 * np.log10(output_rms) if output_rms > 0 else -float('inf')
-                else:
-                    output_db = -float('inf')
-                
-                # Log speech state changes with detailed info
-                if not hasattr(audio_pipeline, '_last_speech_state'):
-                    audio_pipeline._last_speech_state = speech_state
-                elif audio_pipeline._last_speech_state != speech_state:
-                    logger.info(f"[STATE] {audio_pipeline._last_speech_state} → {speech_state} | "
-                              f"VAD: {vad_prob:.3f} ({vad_decision}, {vad_reason}) | "
-                              f"Audio: In={input_db_metric:.1f}dB → Denoised={denoised_db:.1f}dB (NS: {ns_improvement:+.1f}dB) → Norm={normalized_db:.1f}dB → Out={output_db:.1f}dB | "
-                              f"Gate: {'PASS' if gate_passed else 'REJECT'} | "
-                              f"Latency: {processing_time:.1f}ms")
-                    audio_pipeline._last_speech_state = speech_state
-                
-                # Log detailed processing info (every 20 chunks for active speech, every 100 for silence)
-                log_interval = 20 if processed is not None else 100
-                if not hasattr(audio_pipeline, '_log_counter'):
-                    audio_pipeline._log_counter = 0
-                audio_pipeline._log_counter += 1
-                
-                if audio_pipeline._log_counter % log_interval == 0:
-                    vad_decision = "SPEECH" if vad_prob > 0.5 else "NOISE"
-                    status = "ACTIVE" if processed is not None else "SILENT"
-                    logger.info(f"[{status}] State: {speech_state} | "
-                              f"VAD: {vad_prob:.3f} ({vad_decision}, {vad_reason}) | "
-                              f"Audio: In={input_db_metric:.1f}dB → Denoised={denoised_db:.1f}dB (NS: {ns_improvement:+.1f}dB) → Norm={normalized_db:.1f}dB → Out={output_db:.1f}dB | "
-                              f"Gate: {'PASS' if gate_passed else 'REJECT'} | "
-                              f"Latency: {processing_time:.1f}ms")
-                
-                # Send any pending speech events first (before processed_audio)
-                # This ensures events are delivered immediately
-                if websocket in connection_queues:
-                    while connection_queues[websocket]:
-                        event = connection_queues[websocket].pop(0)
-                        try:
-                            await websocket.send_json(event)
-                            logger.info(f"Sent speech event: {event.get('event')} to client")
-                        except Exception as e:
-                            logger.error(f"Error sending speech event: {e}")
-                            break  # Stop if connection is broken
-                
-                # Always send speech_state update immediately (even if no processed audio)
-                # This ensures frontend gets state changes without delay
-                try:
-                    if processed is not None:
-                        processed_bytes = (processed * 32768.0).astype(np.int16).tobytes()
-                        await websocket.send_json({
-                            "type": "processed_audio",
-                            "audio": base64.b64encode(processed_bytes).decode('utf-8'),
-                            "has_speech": True,
-                            "speech_state": speech_state,
-                            "audio_level_db": round(input_db_metric, 2),
-                            "vad_probability": round(vad_prob, 3)
-                        })
-                    else:
-                        # Send state update even when no speech (for immediate UI feedback)
-                        await websocket.send_json({
-                            "type": "processed_audio",
-                            "has_speech": False,
-                            "speech_state": speech_state,
-                            "audio_level_db": round(input_db_metric, 2),
-                            "vad_probability": round(vad_prob, 3)
-                        })
-                except Exception as e:
-                    logger.error(f"Error sending processed_audio: {e}")
-                    break  # Connection is broken, exit loop
-            
-            elif msg_type == "calibrate_noise":
-                noise_bytes = base64.b64decode(msg.get("audio"))
-                noise_float = (np.frombuffer(noise_bytes, dtype=np.int16).astype(np.float32) / 32768.0)
-                audio_pipeline.calibrate_noise_profile(noise_float)
-                await websocket.send_json({"type": "calibration_complete"})
-            
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
-                
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected normally")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-    finally:
-        if websocket in active_connections:
-            active_connections.remove(websocket)
-            logger.info(f"Removed client from active connections (remaining: {len(active_connections)})")
-        if websocket in connection_queues:
-            del connection_queues[websocket]
-        if hasattr(websocket, 'client_state'):
-            websocket.client_state = "closed"
-
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "connections": len(active_connections)}
-
-@app.get("/api/config")
-async def get_config():
-        return {
-            "sample_rate": config.SAMPLE_RATE,
-            "vad_aggressiveness": getattr(config, 'VAD_AGGRESSIVENESS', 3),
-            "vad_frame_ms": config.VAD_FRAME_MS,
-            "noise_suppression_enabled": config.ENABLE_NOISE_SUPPRESSION,
-            "noise_reduction_strength": config.NOISE_REDUCTION_STRENGTH
-        }
-
-# Mount static files (CSS, JS)
-app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
-
-def run_server(host="0.0.0.0", port=8000, use_https=False, ssl_keyfile=None, ssl_certfile=None):
-    if use_https:
-        if not (ssl_keyfile and ssl_certfile and os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile)):
-            logger.error("SSL certificates not found")
+        # Extract audio data
+        if isinstance(data, dict):
+            audio_base64 = data.get('audio', '')
+        elif isinstance(data, str):
+            audio_base64 = data
+        else:
+            logger.error(f"Invalid audio chunk format: {type(data)}")
             return
-        logger.info(f"Starting HTTPS server on {host}:{port}")
-        uvicorn.run(app, host=host, port=port, ssl_keyfile=ssl_keyfile, ssl_certfile=ssl_certfile)
-    else:
-        logger.info(f"Starting HTTP server on {host}:{port}")
-        uvicorn.run(app, host=host, port=port)
+        
+        if not audio_base64:
+            return
+        
+        # Decode base64 audio
+        try:
+            audio_bytes = base64.b64decode(audio_base64)
+            
+            # Validate buffer size (must be multiple of 2 bytes for int16)
+            if len(audio_bytes) % 2 != 0:
+                logger.warning(f"Invalid audio buffer size: {len(audio_bytes)} bytes (must be multiple of 2). Skipping chunk.")
+                return
+            
+            if len(audio_bytes) == 0:
+                return
+            
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            
+            # Debug first few chunks
+            if not hasattr(handle_audio_chunk, '_decode_count'):
+                handle_audio_chunk._decode_count = 0
+            handle_audio_chunk._decode_count += 1
+            if handle_audio_chunk._decode_count <= 5:
+                int16_max = np.abs(audio_int16).max()
+                int16_mean = np.abs(audio_int16).mean()
+                logger.info(f"[Decode Debug {handle_audio_chunk._decode_count}] Int16: {len(audio_int16)} samples, max={int16_max}, mean_abs={int16_mean:.2f}")
+            
+            # Convert to float32 [-1, 1]
+            audio_float = audio_int16.astype(np.float32) / 32768.0
+            
+            # Ensure audio is in valid range [-1, 1]
+            audio_float = np.clip(audio_float, -1.0, 1.0)
+            
+            # Check if audio is actually silent (all zeros or very quiet)
+            audio_max = np.abs(audio_float).max()
+            audio_mean = np.abs(audio_float).mean()
+            
+            if handle_audio_chunk._decode_count <= 5:
+                logger.info(f"[Decode Debug {handle_audio_chunk._decode_count}] Float: max={audio_max:.6f}, mean_abs={audio_mean:.6f}")
+            
+            if audio_max < 1e-6:
+                if handle_audio_chunk._decode_count <= 10:
+                    logger.warning(f"Received silent audio chunk: {len(audio_float)} samples, max={audio_max:.6f}, int16_max={np.abs(audio_int16).max()}")
+                return  # Skip processing silent chunks
+            
+            # Log chunk info occasionally (every 100 chunks to avoid spam)
+            if not hasattr(handle_audio_chunk, '_chunk_count'):
+                handle_audio_chunk._chunk_count = 0
+            handle_audio_chunk._chunk_count += 1
+            if handle_audio_chunk._chunk_count % 100 == 0:
+                logger.debug(f"Audio chunk: {len(audio_float)} samples, range: [{audio_float.min():.3f}, {audio_float.max():.3f}], max_abs={audio_max:.4f}")
+        except Exception as e:
+            logger.error(f"Error decoding audio: {e}")
+            return
+        
+        # Buffer audio chunks until we have enough for VAD
+        # VAD needs at least 480 samples (30ms at 16kHz), but we're getting 171 sample chunks
+        client_id = request.sid
+        if client_id not in client_audio_buffers:
+            client_audio_buffers[client_id] = np.array([], dtype=np.float32)
+        
+        # Add new chunk to buffer
+        client_audio_buffers[client_id] = np.concatenate([client_audio_buffers[client_id], audio_float])
+        
+        # Process when we have enough samples, or if buffer is getting too large
+        max_buffer_size = config.SAMPLE_RATE * 0.5  # Max 500ms buffer
+        if len(client_audio_buffers[client_id]) >= MIN_CHUNK_SIZE_FOR_VAD:
+            # Process accumulated buffer
+            audio_to_process = client_audio_buffers[client_id].copy()
+            # Keep remainder if buffer is larger than needed
+            if len(audio_to_process) > MIN_CHUNK_SIZE_FOR_VAD * 2:
+                # Process in chunks of MIN_CHUNK_SIZE_FOR_VAD, keep remainder
+                process_size = (len(audio_to_process) // MIN_CHUNK_SIZE_FOR_VAD) * MIN_CHUNK_SIZE_FOR_VAD
+                audio_to_process = audio_to_process[:process_size]
+                client_audio_buffers[client_id] = client_audio_buffers[client_id][process_size:]
+            else:
+                # Process all and clear buffer
+                client_audio_buffers[client_id] = np.array([], dtype=np.float32)
+            
+            # Get client's pipeline
+            if client_id not in client_pipelines:
+                logger.warning(f"⚠️ No pipeline for client {client_id}, creating one")
+                try:
+                    client_pipelines[client_id] = AudioPipeline(config, event_callback=speech_event_callback)
+                except Exception as e:
+                    logger.error(f"❌ Failed to create pipeline for client {client_id}: {e}")
+                    # Don't keep retrying - mark this client as failed
+                    client_pipelines[client_id] = None
+                    return
+            
+            audio_pipeline = client_pipelines[client_id]
+            if audio_pipeline is None:
+                # Pipeline creation failed, skip processing
+                return
+            
+            # Check audio level - only filter out complete silence
+            audio_level = np.abs(audio_to_process).max()
+            if audio_level < MIN_AUDIO_LEVEL_FOR_VAD:
+                # Audio too quiet (complete silence), skip processing
+                processed = None
+                input_db = 20 * np.log10(audio_level + 1e-10)
+                emit('processed_audio', {
+                    'audio': '',
+                    'has_speech': False,
+                    'speech_state': 'silence',
+                    'audio_level_db': float(round(input_db, 2)),
+                    'vad_probability': 0.0
+                })
+                return
+            
+            # Log audio level for debugging (first few chunks)
+            if not hasattr(handle_audio_chunk, '_process_count'):
+                handle_audio_chunk._process_count = {}
+            if client_id not in handle_audio_chunk._process_count:
+                handle_audio_chunk._process_count[client_id] = 0
+            handle_audio_chunk._process_count[client_id] += 1
+            if handle_audio_chunk._process_count[client_id] <= 10:
+                logger.info(f"[Process] Client {client_id[:8]}... chunk #{handle_audio_chunk._process_count[client_id]}: {len(audio_to_process)} samples, level={audio_level:.4f}, dB={20*np.log10(audio_level+1e-10):.1f}")
+            
+            # Process through pipeline
+            processed = audio_pipeline.process_chunk(audio_to_process)
+            
+            # Calculate metrics on the processed chunk
+            input_db = 20 * np.log10(np.abs(audio_to_process).max() + 1e-10)
+            vad_prob = audio_pipeline.vad.get_probability(audio_to_process)
+            is_speech = audio_pipeline.vad.is_speech(audio_to_process)
+            speech_state = "speech" if audio_pipeline.is_speaking else "silence"
+        elif len(client_audio_buffers[client_id]) > max_buffer_size:
+            # Buffer too large, process what we have
+            audio_to_process = client_audio_buffers[client_id].copy()
+            client_audio_buffers[client_id] = np.array([], dtype=np.float32)
+            
+            # Get client's pipeline
+            if client_id not in client_pipelines:
+                logger.warning(f"⚠️ No pipeline for client {client_id}, creating one")
+                try:
+                    client_pipelines[client_id] = AudioPipeline(config, event_callback=speech_event_callback)
+                except Exception as e:
+                    logger.error(f"❌ Failed to create pipeline for client {client_id}: {e}")
+                    # Don't keep retrying - mark this client as failed
+                    client_pipelines[client_id] = None
+                    return
+            
+            audio_pipeline = client_pipelines[client_id]
+            if audio_pipeline is None:
+                # Pipeline creation failed, skip processing
+                return
+            
+            # Check audio level
+            audio_level = np.abs(audio_to_process).max()
+            if audio_level < MIN_AUDIO_LEVEL_FOR_VAD:
+                processed = None
+                input_db = 20 * np.log10(audio_level + 1e-10)
+                emit('processed_audio', {
+                    'audio': '',
+                    'has_speech': False,
+                    'speech_state': 'silence',
+                    'audio_level_db': float(round(input_db, 2)),
+                    'vad_probability': 0.0
+                })
+                return
+            
+            processed = audio_pipeline.process_chunk(audio_to_process)
+            
+            # Calculate metrics
+            input_db = 20 * np.log10(np.abs(audio_to_process).max() + 1e-10)
+            vad_prob = audio_pipeline.vad.get_probability(audio_to_process)
+            is_speech = audio_pipeline.vad.is_speech(audio_to_process)
+            speech_state = "speech" if audio_pipeline.is_speaking else "silence"
+        else:
+            # Not enough samples yet, skip processing but send metrics for UI feedback
+            processed = None
+            input_db = 20 * np.log10(np.abs(audio_float).max() + 1e-10)
+            emit('processed_audio', {
+                'audio': '',  # No processed audio yet
+                'has_speech': False,
+                'speech_state': 'buffering',
+                'audio_level_db': float(round(input_db, 2)),
+                'vad_probability': 0.0
+            })
+            return
+        
+        # Log VAD status (only on state changes or occasionally during speech)
+        # Track previous state to detect changes
+        if not hasattr(handle_audio_chunk, '_prev_speech_state'):
+            handle_audio_chunk._prev_speech_state = {}
+        if not hasattr(handle_audio_chunk, '_speech_log_counter'):
+            handle_audio_chunk._speech_log_counter = {}
+        
+        prev_state = handle_audio_chunk._prev_speech_state.get(client_id, None)
+        handle_audio_chunk._prev_speech_state[client_id] = speech_state
+        
+        # Log on state change or every 50 chunks during speech
+        if prev_state != speech_state:
+            # State changed
+            if is_speech:
+                logger.info(f"[VAD] 🟢 Speech START - Samples: {len(audio_to_process)}, VAD: {vad_prob:.3f}, Input: {input_db:.1f}dB")
+            elif prev_state == "speech":
+                logger.info(f"[VAD] 🔴 Speech END - VAD: {vad_prob:.3f}, Input: {input_db:.1f}dB")
+        elif speech_state == "speech":
+            # Log occasionally during continuous speech (every 50 chunks)
+            if client_id not in handle_audio_chunk._speech_log_counter:
+                handle_audio_chunk._speech_log_counter[client_id] = 0
+            handle_audio_chunk._speech_log_counter[client_id] += 1
+            if handle_audio_chunk._speech_log_counter[client_id] % 50 == 0:
+                logger.debug(f"[VAD] 🟢 Speech ongoing - Chunks: {handle_audio_chunk._speech_log_counter[client_id]}, VAD: {vad_prob:.3f}, Input: {input_db:.1f}dB")
+        
+        # Send processed audio back (optional)
+        if processed is not None:
+            processed_bytes = (processed * 32768.0).astype(np.int16).tobytes()
+            emit('processed_audio', {
+                'audio': base64.b64encode(processed_bytes).decode('utf-8'),
+                'has_speech': bool(is_speech),
+                'speech_state': str(speech_state),
+                'audio_level_db': float(round(input_db, 2)),
+                'vad_probability': float(round(vad_prob, 3))
+            })
+    
+    except Exception as e:
+        logger.error(f"❌ Error processing audio chunk: {e}", exc_info=True)
 
-if __name__ == "__main__":
-    run_server()
+if __name__ == '__main__':
+    host = os.getenv('HOST', '0.0.0.0')
+    port = int(os.getenv('PORT', 8000))
+    
+    logger.info(f"Starting HTTPS server on {host}:{port}")
+    
+    # SSL certificates
+    certfile = os.path.join(os.path.dirname(__file__), '../certs/cert.pem')
+    keyfile = os.path.join(os.path.dirname(__file__), '../certs/key.pem')
+    
+    if os.path.exists(certfile) and os.path.exists(keyfile):
+        socketio.run(app, host=host, port=port, certfile=certfile, keyfile=keyfile)
+    else:
+        logger.warning("SSL certificates not found, running without HTTPS")
+        socketio.run(app, host=host, port=port)

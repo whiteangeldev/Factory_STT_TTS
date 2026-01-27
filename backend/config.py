@@ -1,37 +1,14 @@
-"""Audio processing configuration"""
-# Note: dotenv is available for future environment variable support
-# from dotenv import load_dotenv
-# load_dotenv()
+"""Configuration for audio processing"""
+from dataclasses import dataclass
 
+@dataclass
 class AudioConfig:
-    # Audio format settings
-    SAMPLE_RATE = 16000  # 16kHz for most STT APIs
-    CHANNELS = 1  # Mono
-    CHUNK_SIZE = 1024  # Audio chunk size in frames
-    FORMAT = 'int16'  # 16-bit PCM
-    
-    # VAD settings (WebRTC VAD)
-    VAD_AGGRESSIVENESS = 3  # 0-3 (0=least, 3=most aggressive). 3 recommended for 85dB+ factory noise
-    VAD_FRAME_MS = 30  # Frame size in milliseconds (must be 10, 20, or 30)
-    # Note: VAD_THRESHOLD is not used with WebRTC VAD (it uses aggressiveness instead)
-    
-    # Noise suppression settings
-    ENABLE_NOISE_SUPPRESSION = True
-    NOISE_REDUCTION_STRENGTH = 0.8  # 0-1, higher = more aggressive
-    USE_RNNOISE = True  # Use RNNoise if available (better for high noise 85dB+)
-    
-    # Audio normalization
-    ENABLE_NORMALIZATION = True
-    TARGET_DBFS = -20  # Target audio level in dBFS
-    
-    # Noise gating (disabled by default for quiet environments - enable for noisy factories)
-    ENABLE_NOISE_GATING = False  # Set to True for 85dB+ factory noise environments
-    NOISE_GATE_THRESHOLD = 0.005  # RMS threshold below which audio is rejected
-    
-    # Speech detection hangover
-    HANGOVER_MS = 500  # Milliseconds to keep speech active after detection ends
-    MIN_SPEECH_MS = 100  # Minimum speech duration to trigger speech_start
-    
-    # AEC (Acoustic Echo Cancellation)
-    ENABLE_AEC = False  # Enable echo cancellation (requires reference audio)
-    
+    """Audio processing configuration"""
+    SAMPLE_RATE: int = 16000
+    CHANNELS: int = 1
+    CHUNK_SIZE: int = 480  # 30ms at 16kHz
+    VAD_AGGRESSIVENESS: int = 3  # Higher = more aggressive (less sensitive, filters out more noise)
+    VAD_FRAME_MS: int = 30
+    WHISPER_MODEL: str = "base"  # "tiny"=fastest, "base"=balanced speed/accuracy, "small"=better accuracy
+    MIN_SPEECH_DURATION_MS: int = 200  # Minimum speech duration before triggering transcription (increased to reduce false positives)
+    SPEECH_HANGOVER_MS: int = 500  # How long to wait after silence before ending (increased for better speech end detection)
