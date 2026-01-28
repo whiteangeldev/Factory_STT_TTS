@@ -11,6 +11,10 @@ class STTApp {
         this.transcriptionBuffer = [];
         this.inputMode = 'microphone'; // 'microphone' or 'system'
         
+        // VAD smoothing for bottom indicator only
+        this.vadHistory = [];
+        this.currentVadState = false;
+        
         this.init();
     }
     
@@ -674,40 +678,52 @@ class STTApp {
             }
         }
         
-        // Update VAD indicator (green dot in metrics)
+        // Update VAD indicator (green dot in metrics) with smoothing to prevent swing
         const vadDot = document.getElementById('vadDot');
         const vadStatus = document.getElementById('vadStatus');
         
         if (data.has_speech !== undefined) {
-            if (data.has_speech) {
-                // Speech detected - show green dot
-                if (vadDot) vadDot.classList.add('active');
-                if (vadStatus) {
-                    vadStatus.textContent = 'Speech Detected';
-                    vadStatus.style.color = '#4CAF50';
-                }
+            // Add to history (keep last 5 chunks)
+            this.vadHistory.push(data.has_speech);
+            if (this.vadHistory.length > 5) {
+                this.vadHistory.shift();
+            }
+            
+            // Use majority vote for smoothed state
+            const speechCount = this.vadHistory.filter(v => v).length;
+            const smoothedSpeech = (speechCount >= 3);  // 3+ out of 5 = speech
+            
+            // Only update UI if smoothed state changed (prevents swing)
+            if (smoothedSpeech !== this.currentVadState) {
+                this.currentVadState = smoothedSpeech;
                 
-                // Also update header status dot to show speech is detected
-                if (this.isRecording) {
-                    this.updateSystemStatus('speech_detected', 'Speech Detected');
-                }
-            } else {
-                // No speech - hide green dot
-                if (vadDot) vadDot.classList.remove('active');
-                if (vadStatus) {
-                    if (data.speech_state === 'buffering') {
-                        vadStatus.textContent = 'Buffering...';
-                        vadStatus.style.color = '#FF9800';
-                    } else {
-                        vadStatus.textContent = 'No Speech';
-                        vadStatus.style.color = '#666';
+                if (smoothedSpeech) {
+                    // Speech detected - show green dot
+                    if (vadDot) vadDot.classList.add('active');
+                    if (vadStatus) {
+                        vadStatus.textContent = 'Speech Detected';
+                        vadStatus.style.color = '#4CAF50';
+                    }
+                } else {
+                    // No speech - hide green dot
+                    if (vadDot) vadDot.classList.remove('active');
+                    if (vadStatus) {
+                        if (data.speech_state === 'buffering') {
+                            vadStatus.textContent = 'Buffering...';
+                            vadStatus.style.color = '#FF9800';
+                        } else {
+                            vadStatus.textContent = 'No Speech';
+                            vadStatus.style.color = '#666';
+                        }
                     }
                 }
-                
-                // Update header status back to listening if recording and not buffering
-                if (this.isRecording && data.speech_state !== 'buffering' && data.speech_state !== 'speech') {
-                    this.updateSystemStatus('listening', 'Listening...');
-                }
+            }
+            
+            // Update header status (keep original logic)
+            if (data.has_speech && this.isRecording) {
+                this.updateSystemStatus('speech_detected', 'Speech Detected');
+            } else if (!data.has_speech && this.isRecording && data.speech_state !== 'buffering' && data.speech_state !== 'speech') {
+                this.updateSystemStatus('listening', 'Listening...');
             }
         }
         
