@@ -1,105 +1,71 @@
-# Factory STT/TTS
+# Factory STT/TTS - Milestone 1
 
-Real-time Speech-to-Text server using OpenAI Realtime API with VAD and noise suppression.
+Real-time audio capture with Voice Activity Detection (VAD) and dual input modes.
 
 ## Quick Start
 
-### 1. Generate SSL Certificates (for HTTPS)
+### 1. Create Virtual Environment
 
 ```bash
-python3 generate_certs.py
-```
-
-### 2. Run Server
-
-```bash
-python3 run_server.py
-```
-
-The server will automatically use HTTPS if certificates exist, otherwise HTTP.
-
-**Options:**
-- `python3 run_server.py` - Auto-detect HTTPS/HTTP
-- `python3 run_server.py --https` - Force HTTPS (requires certs)
-- `python3 run_server.py --http` - Force HTTP
-- `python3 run_server.py --port 8080` - Custom port
-
-### Manual Setup (Optional)
-
-```bash
-# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate  # Linux/Mac
 # or
-.venv\Scripts\activate.bat   # Windows
+.venv\Scripts\activate  # Windows
+```
 
-# Install dependencies
+### 2. Install Dependencies
+
+```bash
 pip install -r requirements.txt
+```
 
-# Run server
+### 3. Run Server
+
+```bash
 python3 run_server.py
 ```
 
-## Configuration
+Server runs on `https://localhost:8000`.
 
-Set environment variables or create `.env` file:
-```
-OPENAI_API_KEY=your-api-key-here
-HOST=0.0.0.0
-PORT=8000
-```
+## Features (Milestone 1)
 
-## Features
-
-- ✅ **Microphone Mode**: Record from your microphone
-- ✅ **System Audio Mode**: Capture system audio (no browser permissions needed!)
-- ✅ Real-time speech-to-text using OpenAI Realtime API
-- ✅ Voice Activity Detection (VAD) using WebRTC
-- ✅ Noise suppression using RNNoise
-- ✅ WebSocket-based audio streaming
-- ✅ Automatic HTTPS if certificates exist in `certs/`
+- ✅ **Microphone Mode**: Record audio from your microphone
+- ✅ **System Audio Mode**: Capture system audio directly on server (no browser permissions)
+- ✅ **Voice Activity Detection**: Visual indicators for speech detection
+- ✅ **Audio Level Monitoring**: Real-time audio level display
 
 ## Usage
 
-1. Run: `python3 run_server.py`
-2. Open browser: `http://localhost:8000` (or `https://` if SSL certs exist)
+1. Start the server: `python3 run_server.py`
+2. Open browser: `https://localhost:8000`
 3. Select input mode:
-   - **Microphone**: Records from your mic
-   - **System Audio**: Captures system audio from server (no browser permissions!)
-4. Click "Start Recording"
-5. See real-time transcriptions
+   - **Microphone**: Browser captures from your mic
+   - **System Audio**: Server captures system audio (no browser permissions needed)
+4. Click **"Start Recording"**
+5. View VAD status and audio level indicators
 
-## System Audio Mode
+## System Audio Setup
 
-**No browser permissions needed!** Captures system audio directly on the server.
+**macOS:**
+- Install BlackHole: `brew install blackhole-2ch`
+- Create Multi-Output Device in Audio MIDI Setup
+- Add your speakers and BlackHole 2ch to the Multi-Output Device
+- Select Multi-Output Device as system output
 
-1. **Select "System Audio"** from dropdown
-2. **Click "Start Recording"**
-3. **Done!** No browser dialogs, no screen sharing needed
+**Windows:**
+- Enable "Stereo Mix" in Sound settings (Recording devices)
+- Set as default recording device
 
-**Setup (one-time):**
-```bash
-pip install sounddevice
-```
-
-**Platform-specific setup:**
-- **macOS**: May need to enable "Monitor" device in Audio MIDI Setup, or install BlackHole
-- **Windows**: Enable "Stereo Mix" in Sound settings (Recording devices)
-- **Linux**: Configure PulseAudio loopback module
-
-### Troubleshooting
-
-- **System audio not working**: Install `sounddevice` and check system audio device setup
-- **No system audio device found**: See platform-specific setup above
+**Linux:**
+- Configure PulseAudio loopback module
 
 ## Requirements
 
 - Python 3.8+
-- OpenAI API key
-- Modern browser (Chrome/Edge recommended for system audio)
+- Modern browser (Chrome/Edge recommended)
 
 ## Troubleshooting
 
-- **No transcription**: Check `OPENAI_API_KEY` is set
-- **System audio not working**: Use Chrome/Edge, enable "Share system audio" in browser
-- **Connection errors**: Verify network connectivity to OpenAI API
+- **System audio not working**: Check system audio device setup (see above)
+- **VAD not working**: Ensure audio is playing and system audio device is configured correctly
+- **Audio level not updating**: Verify audio is being captured and check browser console for errors
