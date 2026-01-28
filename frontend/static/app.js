@@ -689,9 +689,20 @@ class STTApp {
                 this.vadHistory.shift();
             }
             
-            // Use majority vote for smoothed state
+            // Use hysteresis-based smoothing to prevent swing during speech
+            // - Easier to enter speech state (2+ out of 5 chunks are speech)
+            // - Harder to exit speech state (requires 4+ out of 5 chunks to be silence)
             const speechCount = this.vadHistory.filter(v => v).length;
-            const smoothedSpeech = (speechCount >= 3);  // 3+ out of 5 = speech
+            let smoothedSpeech;
+            
+            if (this.currentVadState) {
+                // Currently in speech state - be lenient to stay (exit only if 4+ chunks are silence)
+                // speechCount >= 1 means at most 4 chunks are silence, so stay in speech
+                smoothedSpeech = (speechCount >= 1);  // Stay in speech unless all 5 chunks are silence
+            } else {
+                // Currently in no-speech state - require moderate evidence to enter (2+ speech chunks)
+                smoothedSpeech = (speechCount >= 2);  // Enter speech if 2+ chunks are speech
+            }
             
             // Only update UI if smoothed state changed (prevents swing)
             if (smoothedSpeech !== this.currentVadState) {
@@ -719,11 +730,17 @@ class STTApp {
                 }
             }
             
-            // Update header status (keep original logic)
-            if (data.has_speech && this.isRecording) {
-                this.updateSystemStatus('speech_detected', 'Speech Detected');
-            } else if (!data.has_speech && this.isRecording && data.speech_state !== 'buffering' && data.speech_state !== 'speech') {
-                this.updateSystemStatus('listening', 'Listening...');
+            // Update header status (top center dot) using same smoothed VAD state as bottom dot
+            if (this.isRecording) {
+                if (smoothedSpeech) {
+                    this.updateSystemStatus('speech_detected', 'Speech Detected');
+                } else {
+                    if (data.speech_state === 'buffering') {
+                        this.updateSystemStatus('listening', 'Buffering...');
+                    } else {
+                        this.updateSystemStatus('listening', 'Listening...');
+                    }
+                }
             }
         }
         
