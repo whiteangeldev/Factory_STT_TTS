@@ -691,14 +691,23 @@ class STTApp {
             
             // Use hysteresis-based smoothing to prevent swing during speech
             // - Easier to enter speech state (2+ out of 5 chunks are speech)
-            // - Harder to exit speech state (requires 4+ out of 5 chunks to be silence)
+            // - Harder to exit speech state, but respect backend's speech_state signal
             const speechCount = this.vadHistory.filter(v => v).length;
             let smoothedSpeech;
             
+            // CRITICAL: If backend says speech ended (speech_state === 'silence'), 
+            // exit speech state more aggressively (require 3+ silence chunks instead of 5)
+            const backendSaysSilence = (data.speech_state === 'silence');
+            
             if (this.currentVadState) {
-                // Currently in speech state - be lenient to stay (exit only if 4+ chunks are silence)
-                // speechCount >= 1 means at most 4 chunks are silence, so stay in speech
-                smoothedSpeech = (speechCount >= 1);  // Stay in speech unless all 5 chunks are silence
+                // Currently in speech state
+                if (backendSaysSilence) {
+                    // Backend says silence - exit if 3+ chunks are silence (speechCount <= 2)
+                    smoothedSpeech = (speechCount >= 3);  // Stay only if 3+ chunks are speech
+                } else {
+                    // Backend still says speech - use normal hysteresis (exit if 4+ chunks are silence)
+                    smoothedSpeech = (speechCount >= 2);  // Stay if 2+ chunks are speech
+                }
             } else {
                 // Currently in no-speech state - require moderate evidence to enter (2+ speech chunks)
                 smoothedSpeech = (speechCount >= 2);  // Enter speech if 2+ chunks are speech
