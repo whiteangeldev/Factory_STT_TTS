@@ -14,7 +14,7 @@ def main():
     parser.add_argument('--https', action='store_true', help='Force HTTPS (requires certs)')
     parser.add_argument('--http', action='store_true', help='Force HTTP (disable HTTPS)')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8000, help='Port to bind to')
+    parser.add_argument('--port', type=int, default=5421, help='Port to bind to')
     args = parser.parse_args()
     
     certfile = os.path.join(os.path.dirname(__file__), 'certs/cert.pem')

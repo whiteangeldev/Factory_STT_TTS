@@ -10,10 +10,18 @@ class STTApp {
         this.audioChunks = [];
         this.transcriptionBuffer = [];
         this.inputMode = 'microphone'; // 'microphone' or 'system'
+        this.transcriptionHistory = []; // Store transcription history
+        this.currentInterimText = ''; // Current interim transcription
+        this.lastTranscriptionTime = null; // Track transcription timestamps
+        this.transcriptionCount = 0; // Count of transcriptions received
         
         // VAD smoothing for bottom indicator only
         this.vadHistory = [];
         this.currentVadState = false;
+        
+        // TTS state
+        this.ttsAudio = null;
+        this.isTTSPlaying = false;
         
         this.init();
     }
@@ -60,6 +68,15 @@ class STTApp {
         this.socket.on('connected', (data) => {
             console.log('✅ Server confirmed connection:', data);
             this.log(data.message || 'Socket.IO ready - VAD and noise reduction active', 'success');
+        });
+        
+        // TTS event handlers
+        this.socket.on('tts_audio', (data) => {
+            this.handleTTSAudio(data);
+        });
+        
+        this.socket.on('tts_error', (data) => {
+            this.handleTTSError(data);
         });
         
         this.socket.on('recording_status', (data) => {
@@ -165,6 +182,13 @@ class STTApp {
                 this.inputMode = oldMode;
             }
         });
+        
+        // TTS event listeners
+        document.getElementById('ttsPlayBtn').addEventListener('click', () => this.playTTS());
+        document.getElementById('ttsStopBtn').addEventListener('click', () => this.stopTTS());
+        document.getElementById('ttsSpeed').addEventListener('input', (e) => {
+            document.getElementById('ttsSpeedValue').textContent = `${parseFloat(e.target.value).toFixed(1)}x`;
+        });
     }
     
     async startRecording() {
@@ -219,6 +243,11 @@ class STTApp {
                 this.isStopping = false;
                 this.audioChunks = [];
                 this.transcriptionBuffer = [];
+                this.transcriptionHistory = [];
+                this.currentInterimText = '';
+                this.lastTranscriptionTime = null;
+                this.transcriptionCount = 0;
+                this.recordingStartTime = Date.now() / 1000;
                 
                 // Reset counters for logging
                 this._processedAudioCount = 0;
@@ -297,6 +326,11 @@ class STTApp {
             this.isStopping = false;  // Reset stopping flag when starting
             this.audioChunks = [];
             this.transcriptionBuffer = [];
+            this.transcriptionHistory = [];
+            this.currentInterimText = '';
+            this.lastTranscriptionTime = null;
+            this.transcriptionCount = 0;
+            this.recordingStartTime = Date.now() / 1000;
             
             // Clear transcription area
             const area = document.getElementById('transcriptionArea');
@@ -793,12 +827,54 @@ class STTApp {
         const text = data.text || '';
         if (!text) return;
         
+        // Remove any interim transcription for this segment
+        this.currentInterimText = '';
         const area = document.getElementById('transcriptionArea');
+        const existingInterim = area.querySelector('.transcription-item.interim');
+        if (existingInterim) {
+            existingInterim.remove();
+        }
+        
+        // Calculate latency if timestamp provided
+        let latencyInfo = '';
+        if (data.timestamp && this.lastTranscriptionTime) {
+            const latency = ((data.timestamp - this.lastTranscriptionTime) * 1000).toFixed(0);
+            latencyInfo = ` <span class="latency-badge">${latency}ms</span>`;
+        }
+        this.lastTranscriptionTime = data.timestamp || Date.now() / 1000;
+        
+        // Create final transcription item
         const item = document.createElement('div');
         item.className = 'transcription-item final';
-        item.textContent = text;
+        
+        // Add confidence indicator if available
+        const confidence = data.confidence || 1.0;
+        const confidenceClass = confidence >= 0.9 ? 'high' : confidence >= 0.7 ? 'medium' : 'low';
+        const confidenceBadge = `<span class="confidence-badge ${confidenceClass}">${(confidence * 100).toFixed(0)}%</span>`;
+        
+        item.innerHTML = `
+            <div class="transcription-header">
+                <span class="transcription-label">✓ Final</span>
+                ${confidenceBadge}
+                ${latencyInfo}
+            </div>
+            <div class="transcription-text">${this.escapeHtml(text)}</div>
+        `;
+        
         area.appendChild(item);
-        area.scrollTop = area.scrollHeight;
+        this.scrollToBottom(area);
+        
+        // Add to history
+        this.transcriptionHistory.push({
+            text: text,
+            timestamp: data.timestamp || Date.now() / 1000,
+            confidence: confidence,
+            is_final: true
+        });
+        this.transcriptionCount++;
+        
+        // Update transcription count in UI
+        this.updateTranscriptionStats();
         
         this.log(`Final transcription: ${text.substring(0, 50)}...`, 'success');
     }
@@ -807,6 +883,7 @@ class STTApp {
         const text = data.text || '';
         if (!text) return;
         
+        this.currentInterimText = text;
         const area = document.getElementById('transcriptionArea');
         
         // Remove previous interim item if exists
@@ -815,12 +892,54 @@ class STTApp {
             existingInterim.remove();
         }
         
-        // Add new interim item
+        // Calculate latency if this is first interim
+        let latencyInfo = '';
+        if (data.timestamp && !this.lastTranscriptionTime) {
+            // First transcription - measure from start
+            const startTime = this.recordingStartTime || Date.now() / 1000;
+            const latency = ((data.timestamp - startTime) * 1000).toFixed(0);
+            latencyInfo = ` <span class="latency-badge first">${latency}ms</span>`;
+        }
+        
+        // Add new interim item with better visual feedback
         const item = document.createElement('div');
         item.className = 'transcription-item interim';
-        item.textContent = text;
+        const confidence = data.confidence || 0.8;
+        const confidenceBadge = `<span class="confidence-badge interim">${(confidence * 100).toFixed(0)}%</span>`;
+        
+        item.innerHTML = `
+            <div class="transcription-header">
+                <span class="transcription-label">⟳ Processing</span>
+                ${confidenceBadge}
+                ${latencyInfo}
+            </div>
+            <div class="transcription-text">${this.escapeHtml(text)}</div>
+        `;
+        
         area.appendChild(item);
-        area.scrollTop = area.scrollHeight;
+        this.scrollToBottom(area);
+    }
+    
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    
+    scrollToBottom(element) {
+        // Smooth scroll to bottom
+        element.scrollTo({
+            top: element.scrollHeight,
+            behavior: 'smooth'
+        });
+    }
+    
+    updateTranscriptionStats() {
+        // Update transcription count if element exists
+        const statsEl = document.getElementById('transcriptionStats');
+        if (statsEl) {
+            statsEl.textContent = `${this.transcriptionCount} transcriptions`;
+        }
     }
     
     updateSystemStatus(state, text) {
@@ -970,3 +1089,119 @@ class STTApp {
 document.addEventListener('DOMContentLoaded', () => {
     window.app = new STTApp();
 });
+
+// TTS methods
+STTApp.prototype.playTTS = function() {
+    const text = document.getElementById('ttsText').value.trim();
+    const speed = parseFloat(document.getElementById('ttsSpeed').value);
+    
+    if (!text) {
+        this.log('Please enter text to synthesize', 'warning');
+        this.updateTTSStatus('Please enter text to synthesize', 'warning');
+        return;
+    }
+    
+    if (!this.socket || !this.socket.connected) {
+        this.log('Not connected to server', 'error');
+        this.updateTTSStatus('Not connected to server', 'error');
+        return;
+    }
+    
+    // Stop any currently playing audio
+    this.stopTTS();
+    
+    // Update UI
+    document.getElementById('ttsPlayBtn').disabled = true;
+    document.getElementById('ttsStopBtn').disabled = false;
+    this.updateTTSStatus('Detecting language and synthesizing speech...', 'info');
+    
+    // Request TTS synthesis (language will be auto-detected on server)
+    this.socket.emit('synthesize_speech', {
+        text: text,
+        speed: speed
+    });
+};
+
+STTApp.prototype.stopTTS = function() {
+    if (this.ttsAudio) {
+        this.ttsAudio.pause();
+        this.ttsAudio.currentTime = 0;
+        this.ttsAudio = null;
+    }
+    this.isTTSPlaying = false;
+    document.getElementById('ttsPlayBtn').disabled = false;
+    document.getElementById('ttsStopBtn').disabled = true;
+    this.updateTTSStatus('', '');
+};
+
+STTApp.prototype.handleTTSAudio = function(data) {
+    try {
+        // Decode base64 audio
+        const audioData = atob(data.audio);
+        const audioArray = new Uint8Array(audioData.length);
+        for (let i = 0; i < audioData.length; i++) {
+            audioArray[i] = audioData.charCodeAt(i);
+        }
+        
+        // Create blob and audio element
+        const blob = new Blob([audioArray], { type: 'audio/wav' });
+        const audioUrl = URL.createObjectURL(blob);
+        
+        // Stop any existing audio
+        this.stopTTS();
+        
+        // Create new audio element
+        this.ttsAudio = new Audio(audioUrl);
+        this.isTTSPlaying = true;
+        
+        // Set up event handlers
+        this.ttsAudio.onended = () => {
+            this.stopTTS();
+            this.updateTTSStatus('Playback completed', 'success');
+            URL.revokeObjectURL(audioUrl);
+        };
+        
+        this.ttsAudio.onerror = (e) => {
+            console.error('TTS audio playback error:', e);
+            this.stopTTS();
+            this.updateTTSStatus('Playback error', 'error');
+            URL.revokeObjectURL(audioUrl);
+        };
+        
+        // Play audio
+        const langName = data.language === 'en' ? 'English' : data.language === 'zh' ? 'Chinese' : data.language === 'ja' ? 'Japanese' : data.language;
+        this.ttsAudio.play().then(() => {
+            this.updateTTSStatus(`Playing: "${data.text.substring(0, 50)}${data.text.length > 50 ? '...' : ''}" (${langName})`, 'success');
+        }).catch((err) => {
+            console.error('Error playing TTS audio:', err);
+            this.stopTTS();
+            this.updateTTSStatus('Failed to play audio', 'error');
+            URL.revokeObjectURL(audioUrl);
+        });
+        
+    } catch (error) {
+        console.error('Error handling TTS audio:', error);
+        this.stopTTS();
+        this.updateTTSStatus('Error processing audio', 'error');
+    }
+};
+
+STTApp.prototype.handleTTSError = function(data) {
+    this.stopTTS();
+    this.updateTTSStatus(data.message || 'TTS synthesis error', 'error');
+    this.log(`TTS Error: ${data.message}`, 'error');
+};
+
+STTApp.prototype.updateTTSStatus = function(message, type) {
+    const statusEl = document.getElementById('ttsStatus');
+    if (!statusEl) return;
+    
+    if (!message) {
+        statusEl.textContent = '';
+        statusEl.className = 'tts-status';
+        return;
+    }
+    
+    statusEl.textContent = message;
+    statusEl.className = `tts-status tts-status-${type}`;
+};

@@ -6,11 +6,11 @@ import os
 logger = logging.getLogger(__name__)
 
 try:
-    import rnnoise
+    import pyrnnoise as rnnoise
     RNNOISE_AVAILABLE = True
 except ImportError:
     RNNOISE_AVAILABLE = False
-    logger.warning("rnnoise library not available. Install with: pip install rnnoise")
+    logger.warning("rnnoise library not available. Install with: pip install pyrnnoise")
     logger.warning("Falling back to simple noise gate")
 
 class RNNoise:
@@ -28,16 +28,28 @@ class RNNoise:
         if not RNNOISE_AVAILABLE:
             logger.warning("RNNoise not available - using fallback noise gate")
             self.denoiser = None
+            self.process_method = None
             return
         
         try:
             # RNNoise works internally at 48000 Hz
             # We'll handle resampling if needed
-            self.denoiser = rnnoise.RNNoise()
-            logger.info("RNNoise initialized successfully")
+            self.denoiser = rnnoise.RNNoise(sample_rate=48000)
+            # Check which method is available (pyrnnoise uses 'filter', not 'process')
+            if hasattr(self.denoiser, 'filter'):
+                self.process_method = 'filter'
+            elif hasattr(self.denoiser, 'process'):
+                self.process_method = 'process'
+            elif callable(self.denoiser):
+                # Some versions are callable directly
+                self.process_method = '__call__'
+            else:
+                raise AttributeError("RNNoise object has no 'filter' or 'process' method")
+            logger.info(f"RNNoise initialized successfully (using method: {self.process_method})")
         except Exception as e:
             logger.error(f"Failed to initialize RNNoise: {e}")
             self.denoiser = None
+            self.process_method = None
     
     def reduce_noise(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -83,8 +95,15 @@ class RNNoise:
                 if len(frame) < frame_size:
                     frame = np.pad(frame, (0, frame_size - len(frame)), mode='constant')
                 
-                # Process frame
-                denoised_frame = self.denoiser.process(frame)
+                # Process frame using the correct method
+                if self.process_method == 'filter':
+                    denoised_frame = self.denoiser.filter(frame)
+                elif self.process_method == 'process':
+                    denoised_frame = self.denoiser.process(frame)
+                elif self.process_method == '__call__':
+                    denoised_frame = self.denoiser(frame)
+                else:
+                    raise AttributeError(f"Unknown process method: {self.process_method}")
                 output_frames.append(denoised_frame)
             
             # Combine frames
@@ -107,8 +126,23 @@ class RNNoise:
             
             return denoised.astype(np.float32)
             
+        except AttributeError as e:
+            # Only log this error once to avoid spam
+            if not hasattr(self, '_method_error_logged'):
+                logger.error(f"RNNoise method error: {e}. Available methods: {dir(self.denoiser) if self.denoiser else 'N/A'}")
+                logger.error("RNNoise will be disabled. Please check pyrnnoise library version.")
+                self._method_error_logged = True
+                self.denoiser = None  # Disable to prevent repeated errors
+            return self._simple_noise_gate(audio)
         except Exception as e:
-            logger.warning(f"RNNoise processing failed: {e}, using original audio")
+            # Only log other errors occasionally to avoid spam
+            if not hasattr(self, '_processing_error_count'):
+                self._processing_error_count = 0
+            self._processing_error_count += 1
+            if self._processing_error_count <= 3:
+                logger.warning(f"RNNoise processing failed: {e}, using original audio")
+            elif self._processing_error_count == 4:
+                logger.warning("RNNoise processing errors continuing - suppressing further warnings")
             return audio
     
     def _simple_noise_gate(self, audio: np.ndarray, threshold=0.01) -> np.ndarray:

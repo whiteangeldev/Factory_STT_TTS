@@ -31,13 +31,17 @@ class OpenAIRealtimeSTT:
         self.ws = None
         self.is_connected = False
         self.is_streaming = False
-        self.audio_queue = queue.Queue(maxsize=100)  # Limit queue size to prevent memory issues
+        self.audio_queue = queue.Queue(maxsize=50)  # Smaller queue for lower latency
         self.stream_thread = None
         self.ws_thread = None
         self.connection_lock = threading.Lock()
         self.session_id = None
         self.audio_chunks_sent = 0
         self.transcriptions_received = 0
+        self.first_audio_time = None  # Track when first audio is sent
+        self.first_transcription_time = None  # Track when first transcription arrives
+        self.pending_transcription = False  # Track if we're waiting for transcription
+        self.last_item_id = None  # Track the last item ID we're waiting for transcription
         
         logger.info(f"OpenAI Realtime STT initialized (model={model}, sample_rate={sample_rate})")
     
@@ -118,6 +122,34 @@ class OpenAIRealtimeSTT:
                 
                 if self.ws and self.is_connected:
                     try:
+                        # Check if buffer was already committed automatically by API
+                        # If not, commit it manually
+                        if self.pending_transcription or self.last_item_id:
+                            logger.info(f"[STT] Buffer already committed (item_id={self.last_item_id}) - waiting for transcription...")
+                        else:
+                            # Commit any remaining audio in the buffer
+                            commit_event = {"type": "input_audio_buffer.commit"}
+                            self.ws.send(json.dumps(commit_event))
+                            logger.info("[STT] Committed final audio buffer - waiting for transcription...")
+                            self.pending_transcription = True
+                        
+                        # Wait longer for transcription events to arrive (up to 5 seconds)
+                        # Transcription can take time after buffer commit, especially for longer speech
+                        max_wait = 5.0
+                        wait_interval = 0.2
+                        waited = 0.0
+                        while waited < max_wait and self.pending_transcription:
+                            time.sleep(wait_interval)
+                            waited += wait_interval
+                            if not self.pending_transcription:
+                                logger.info(f"[STT] Transcription received after {waited:.2f}s")
+                                break
+                        
+                        if self.pending_transcription:
+                            logger.warning(f"[STT] Still waiting for transcription after {waited:.2f}s - proceeding anyway")
+                        else:
+                            logger.info(f"[STT] Transcription completed, closing stream")
+                        
                         end_event = {
                             "type": "session.update",
                             "session": {
@@ -131,8 +163,8 @@ class OpenAIRealtimeSTT:
                             }
                         }
                         self.ws.send(json.dumps(end_event))
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Error in stop_stream cleanup: {e}")
                 
                 while not self.audio_queue.empty():
                     try:
@@ -175,10 +207,15 @@ class OpenAIRealtimeSTT:
             # Clip to valid range
             audio = np.clip(audio, -1.0, 1.0)
             
+            # Track first audio timestamp for latency measurement
+            if self.first_audio_time is None:
+                self.first_audio_time = time.time()
+            
             # Check for silence (skip if all zeros to reduce bandwidth)
+            # Use a lower threshold to avoid filtering out quiet speech
             max_level = np.abs(audio).max()
-            if max_level < 0.001:
-                return  # Skip silence chunks
+            if max_level < 0.0001:  # Lowered from 0.001 to avoid filtering quiet speech
+                return  # Skip only truly silent chunks
             
             # Convert to int16 PCM
             audio_int16 = (audio * 32767.0).astype(np.int16)
@@ -186,8 +223,11 @@ class OpenAIRealtimeSTT:
             # Put in queue (non-blocking, drop if queue is full)
             try:
                 self.audio_queue.put_nowait(audio_int16.tobytes())
+                # Log first few chunks to verify they're being queued
+                if self.audio_chunks_sent == 0:
+                    logger.debug(f"[STT] First audio chunk queued (len={len(audio_int16)}, max={max_level:.6f})")
             except queue.Full:
-                logger.warning("Audio queue full, dropping chunk")
+                logger.warning(f"Audio queue full, dropping chunk (queue size: {self.audio_queue.qsize()})")
         
         except Exception as e:
             logger.error(f"Error sending audio to STT: {e}", exc_info=True)
@@ -205,7 +245,7 @@ class OpenAIRealtimeSTT:
         while self.is_streaming:
             try:
                 try:
-                    audio_bytes = self.audio_queue.get(timeout=0.1)
+                    audio_bytes = self.audio_queue.get(timeout=0.05)  # Reduced timeout for lower latency
                 except queue.Empty:
                     continue
                 
@@ -216,11 +256,17 @@ class OpenAIRealtimeSTT:
                         self.ws.send(json.dumps(event))
                         self.audio_chunks_sent += 1
                         
-                        # Log first few chunks and periodically
-                        if self.audio_chunks_sent <= 3:
-                            logger.debug(f"[STT Audio] Sent chunk {self.audio_chunks_sent} ({len(audio_bytes)} bytes)")
-                        elif self.audio_chunks_sent % 100 == 0:
-                            logger.debug(f"[STT Audio] Sent {self.audio_chunks_sent} chunks, received {self.transcriptions_received} transcriptions")
+                        # Log first few chunks to verify they're being sent
+                        if self.audio_chunks_sent <= 5:
+                            logger.info(f"[STT Audio] Sent chunk {self.audio_chunks_sent} ({len(audio_bytes)} bytes, {len(audio_base64)} base64 chars)")
+                        
+                        # Don't commit buffer automatically - let speech end trigger final commit
+                        # This prevents early finalization of transcription
+                        # Buffer commits will happen when speech ends (in stop_stream)
+                        
+                        # Log periodically
+                        if self.audio_chunks_sent % 100 == 0:
+                            logger.info(f"[STT Audio] Sent {self.audio_chunks_sent} chunks, received {self.transcriptions_received} transcriptions")
                     
                     except Exception as e:
                         logger.error(f"Error streaming audio to STT: {e}")
@@ -236,13 +282,13 @@ class OpenAIRealtimeSTT:
         try:
             self.is_connected = True
             
-            # Configure session for transcription
-            # Important: modalities should include "audio" to enable transcription
+            # Configure session for low-latency, high-accuracy transcription
+            # Optimized settings for real-time transcription with minimal delay
             session_config = {
                 "type": "session.update",
                 "session": {
-                    "instructions": "You are a transcription assistant. Transcribe the audio accurately.",
-                    "modalities": ["audio", "text"],  # Include "audio" to enable transcription
+                    "instructions": "You are a transcription assistant. Transcribe the audio accurately and in real-time.",
+                    "modalities": ["audio", "text"],  # Required: ["audio", "text"] for transcription
                     "voice": "alloy",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
@@ -252,8 +298,8 @@ class OpenAIRealtimeSTT:
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500
+                        "prefix_padding_ms": 200,  # Reduced from 300ms for faster response
+                        "silence_duration_ms": 300  # Reduced from 500ms for lower latency
                     }
                 }
             }
@@ -261,6 +307,14 @@ class OpenAIRealtimeSTT:
             logger.debug("Sending session configuration...")
             ws.send(json.dumps(session_config))
             logger.debug("Session configuration sent")
+            
+            # Request transcription explicitly after session is configured
+            # This ensures transcription is enabled
+            transcription_request = {
+                "type": "input_audio_buffer.commit"
+            }
+            logger.debug("Requesting transcription...")
+            # Note: We'll send this after we start receiving audio, not here
             
         except Exception as e:
             logger.error(f"Error configuring STT session: {e}", exc_info=True)
@@ -272,8 +326,8 @@ class OpenAIRealtimeSTT:
             event_type = data.get("type", "")
             
             # Log all received events (except ping/pong) to debug transcription issues
-            if event_type not in ["ping", "pong"]:
-                logger.debug(f"[STT Event] {event_type}: {json.dumps(data)[:200]}")
+            if event_type not in ["ping", "pong", "session.updated"]:
+                logger.info(f"[STT Event] {event_type}: {json.dumps(data)[:300]}")
             
             if event_type == "session.created":
                 self.session_id = data.get("session", {}).get("id")
@@ -281,51 +335,106 @@ class OpenAIRealtimeSTT:
             
             # Handle transcription events - multiple possible formats
             elif event_type == "conversation.item.input_audio_transcription.completed":
-                item = data.get("item", {})
-                transcription = item.get("input_audio_transcription", {})
-                if isinstance(transcription, dict):
-                    text = transcription.get("transcript", "").strip()
+                # Get transcript from the event data directly
+                transcript = data.get("transcript", "")
+                if not transcript:
+                    # Fallback: try to get from item structure
+                    item = data.get("item", {})
+                    if item:
+                        transcription = item.get("input_audio_transcription", {})
+                        if isinstance(transcription, dict):
+                            transcript = transcription.get("transcript", "").strip()
+                        else:
+                            transcript = str(transcription).strip()
                 else:
-                    text = str(transcription).strip()
+                    transcript = transcript.strip()
                 
-                if text and self.on_transcript:
+                if transcript and self.on_transcript:
                     self.transcriptions_received += 1
-                    logger.info(f"[STT FINAL #{self.transcriptions_received}] '{text}'")
-                    self.on_transcript(text, True, "en", 1.0)
+                    self.pending_transcription = False  # Mark transcription as received
+                    # Track latency
+                    if self.first_transcription_time is None and self.first_audio_time:
+                        latency = time.time() - self.first_audio_time
+                        logger.info(f"[STT Latency] First transcription: {latency:.3f}s")
+                        self.first_transcription_time = time.time()
+                    logger.info(f"[STT FINAL #{self.transcriptions_received}] '{transcript}'")
+                    self.on_transcript(transcript, True, "en", 1.0)
+                elif not transcript:
+                    logger.warning(f"[STT] Received completed event but transcript is empty: {json.dumps(data)[:200]}")
             
             elif event_type == "conversation.item.input_audio_transcription.delta":
-                # Interim transcriptions (partial results)
+                # Interim transcriptions (partial results) - send immediately for low latency
                 delta = data.get("delta", "")
                 if delta and isinstance(delta, str) and delta.strip():
-                    logger.debug(f"[STT INTERIM] '{delta[:60]}...'")
+                    # Track first interim result latency
+                    if self.first_transcription_time is None and self.first_audio_time:
+                        latency = time.time() - self.first_audio_time
+                        logger.info(f"[STT Latency] First interim: {latency:.3f}s")
+                        self.first_transcription_time = time.time()
+                    logger.info(f"[STT INTERIM] '{delta}'")
                     if self.on_transcript:
                         self.on_transcript(delta.strip(), False, "en", 0.8)
+                    # Don't mark pending as False for interim - wait for completed event
             
             elif event_type == "conversation.item.created":
                 # Check if this is a transcription item
                 item = data.get("item", {})
                 item_type = item.get("type", "")
+                item_id = item.get("id", "")
+                
+                # If this is the item we're waiting for, mark that we're waiting
+                if item_id == self.last_item_id:
+                    self.pending_transcription = True
+                    logger.info(f"[STT] Item created for committed buffer (id={item_id}) - waiting for transcription")
                 
                 # Handle different item types that might contain transcriptions
                 text = None
                 if item_type == "input_audio_transcription":
                     text = item.get("transcript", "").strip()
                 elif item_type == "message":
-                    transcription = item.get("input_audio_transcription", {})
-                    if isinstance(transcription, dict):
-                        text = transcription.get("transcript", "").strip()
-                    elif isinstance(transcription, str):
-                        text = transcription.strip()
+                    # Check content array for transcription (transcript might be in content[0].transcript)
+                    content = item.get("content", [])
+                    for content_item in content:
+                        if content_item.get("type") == "input_audio":
+                            # Transcript might be in the content item
+                            transcript = content_item.get("transcript")
+                            if transcript:
+                                text = transcript.strip()
+                                break
+                    
+                    # Also check for input_audio_transcription field
+                    if not text:
+                        transcription = item.get("input_audio_transcription", {})
+                        if isinstance(transcription, dict):
+                            text = transcription.get("transcript", "").strip()
+                        elif isinstance(transcription, str):
+                            text = transcription.strip()
                 
                 if text and self.on_transcript:
                     self.transcriptions_received += 1
+                    self.pending_transcription = False
                     logger.info(f"[STT CREATED #{self.transcriptions_received}] '{text}'")
                     self.on_transcript(text, True, "en", 1.0)
+                elif item_type == "message":
+                    # Log when we get a message item but no transcript yet (transcription might come later)
+                    logger.info(f"[STT] Message item created (id={item_id}) but transcript is null - waiting for transcription events")
             
             elif event_type == "conversation.item.update":
                 # Check for transcription updates
                 item = data.get("item", {})
-                if "input_audio_transcription" in item:
+                
+                # Check content array for transcription updates
+                content = item.get("content", [])
+                text = None
+                for content_item in content:
+                    if content_item.get("type") == "input_audio":
+                        transcript = content_item.get("transcript")
+                        if transcript:
+                            text = transcript.strip()
+                            break
+                
+                # Also check for input_audio_transcription field
+                if not text and "input_audio_transcription" in item:
                     transcription = item.get("input_audio_transcription", {})
                     if isinstance(transcription, dict):
                         text = transcription.get("transcript", "").strip()
@@ -333,11 +442,11 @@ class OpenAIRealtimeSTT:
                         text = transcription.strip()
                     else:
                         text = str(transcription).strip()
-                    
-                    if text and self.on_transcript:
-                        self.transcriptions_received += 1
-                        logger.info(f"[STT UPDATE #{self.transcriptions_received}] '{text}'")
-                        self.on_transcript(text, True, "en", 1.0)
+                
+                if text and self.on_transcript:
+                    self.transcriptions_received += 1
+                    logger.info(f"[STT UPDATE #{self.transcriptions_received}] '{text}'")
+                    self.on_transcript(text, True, "en", 1.0)
             
             elif event_type == "error":
                 error = data.get("error", {})
@@ -357,10 +466,36 @@ class OpenAIRealtimeSTT:
             elif event_type == "input_audio_buffer.speech_stopped":
                 logger.debug("Speech stopped in STT buffer")
             
+            elif event_type == "input_audio_buffer.committed":
+                # Buffer committed - transcription should be coming soon
+                item_id = data.get("item_id")
+                self.last_item_id = item_id
+                self.pending_transcription = True
+                logger.info(f"[STT] Audio buffer committed for item: {item_id} - waiting for transcription")
+                # Don't extract transcription here - wait for conversation.item events
+            
             else:
-                # Log unknown events for debugging
+                # Log unknown events for debugging - might contain transcription data
                 if event_type not in ["session.updated", "response.audio_transcription.delta", "response.audio_transcription.done"]:
-                    logger.debug(f"[STT Unknown Event] {event_type}")
+                    logger.info(f"[STT Unknown Event] {event_type}: {json.dumps(data)[:300]}")
+                    # Check if this unknown event contains transcription data
+                    event_str = json.dumps(data).lower()
+                    if "transcription" in event_str or "transcript" in event_str:
+                        logger.warning(f"[STT] Unknown event with transcription data: {event_type}")
+                        # Try to extract transcription from unknown event
+                        text = None
+                        if "transcript" in data:
+                            text = data.get("transcript", "").strip()
+                        elif "transcription" in data:
+                            trans = data.get("transcription", {})
+                            if isinstance(trans, dict):
+                                text = trans.get("transcript", "").strip()
+                            elif isinstance(trans, str):
+                                text = trans.strip()
+                        
+                        if text and self.on_transcript:
+                            logger.info(f"[STT EXTRACTED] '{text}'")
+                            self.on_transcript(text, True, "en", 0.9)
         
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse STT message as JSON: {e}")

@@ -25,6 +25,16 @@ from .config import AudioConfig
 from .audio.pipeline import AudioPipeline
 from .audio.system_audio import SystemAudioCapture
 
+# Try to import TTS (optional - server can run without it)
+try:
+    from .audio.tts import synthesize_speech
+    _HAS_TTS = True
+except (ImportError, RuntimeError, PermissionError) as e:
+    # Logger not yet defined, use print for early import errors
+    print(f"Warning: TTS not available: {e}. TTS feature will be disabled.")
+    _HAS_TTS = False
+    synthesize_speech = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -511,9 +521,66 @@ def handle_audio_chunk(data):
     except Exception as e:
         logger.error(f"Error processing audio chunk: {e}", exc_info=True)
 
+@socketio.on('synthesize_speech')
+def handle_synthesize_speech(data):
+    """Handle TTS synthesis request"""
+    client_id = request.sid
+    try:
+        if not _HAS_TTS or synthesize_speech is None:
+            emit('tts_error', {
+                'message': 'TTS is not available. Please install TTS dependencies:\n\n' +
+                          'For English TTS:\n' +
+                          '  pip install torch transformers datasets soundfile\n\n' +
+                          'For Chinese/Japanese TTS:\n' +
+                          '  pip install gtts pydub\n\n' +
+                          'For speed adjustment:\n' +
+                          '  pip install librosa'
+            })
+            return
+        
+        text = data.get('text', '').strip()
+        language = data.get('language', 'auto').strip()  # Default to auto-detect
+        speed = float(data.get('speed', 1.0))
+        
+        if not text:
+            emit('tts_error', {'message': 'Text is required'})
+            return
+        
+        logger.info(f"[TTS] Synthesizing speech for {client_id[:8]}: text='{text[:50]}...', language={language} (auto-detect), speed={speed}")
+        
+        # Synthesize speech (language will be auto-detected if 'auto')
+        audio_bytes, sample_rate = synthesize_speech(
+            text=text,
+            language=language,
+            speed=speed,
+            device_preference="auto"
+        )
+        
+        # Convert to base64 for transmission
+        import base64
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+        
+        # Detect the actual language used (in case it was auto-detected)
+        from .audio.tts import detect_language
+        detected_lang = detect_language(text) if language == 'auto' else language
+        
+        logger.info(f"[TTS] Synthesized {len(audio_bytes)} bytes of audio (sample_rate={sample_rate}Hz, language={detected_lang})")
+        
+        # Emit audio data to client
+        emit('tts_audio', {
+            'audio': audio_b64,
+            'sample_rate': sample_rate,
+            'text': text,
+            'language': detected_lang
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in synthesize_speech: {e}", exc_info=True)
+        emit('tts_error', {'message': str(e)})
+
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')
-    port = int(os.getenv('PORT', 8000))
+    port = int(os.getenv('PORT', 5421))
     certfile = os.path.join(os.path.dirname(__file__), '../certs/cert.pem')
     keyfile = os.path.join(os.path.dirname(__file__), '../certs/key.pem')
     

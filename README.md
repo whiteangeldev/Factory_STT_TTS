@@ -25,7 +25,7 @@ pip install -r requirements.txt
 python3 run_server.py
 ```
 
-Server runs on `https://localhost:8000`.
+Server runs on `https://localhost:5421`.
 
 ## Features (Milestone 1)
 
@@ -37,7 +37,7 @@ Server runs on `https://localhost:8000`.
 ## Usage
 
 1. Start the server: `python3 run_server.py`
-2. Open browser: `https://localhost:8000`
+2. Open browser: `https://localhost:5421`
 3. Select input mode:
    - **Microphone**: Browser captures from your mic
    - **System Audio**: Server captures system audio (no browser permissions needed)
@@ -63,6 +63,35 @@ Server runs on `https://localhost:8000`.
 
 - Python 3.8+
 - Modern browser (Chrome/Edge recommended)
+
+## TTS (Text-to-Speech) Setup
+
+TTS is optional. To enable TTS functionality:
+
+**For Chinese/Japanese TTS (Recommended - Lightweight):**
+```bash
+pip install gtts pydub
+```
+
+**For English TTS (Requires PyTorch):**
+```bash
+pip install torch transformers datasets soundfile
+```
+
+**For speed adjustment (Optional):**
+```bash
+pip install librosa
+```
+
+**Quick install script:**
+```bash
+./install_tts.sh
+```
+
+Or install all at once:
+```bash
+pip install gtts pydub torch transformers datasets soundfile librosa
+```
 
 ## Troubleshooting
 

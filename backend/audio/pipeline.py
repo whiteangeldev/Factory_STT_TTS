@@ -50,18 +50,21 @@ class AudioPipeline:
     
     def _on_transcript(self, text: str, is_final: bool, language: str, confidence: float):
         if not text or not text.strip():
+            logger.debug(f"[Pipeline STT] Empty transcription received (is_final={is_final})")
             return
         
         # Log transcription
         status = "FINAL" if is_final else "INTERIM"
         logger.info(f"[Pipeline STT {status}] '{text[:80]}...'")
         
-        # Emit to frontend
+        # Emit to frontend with timestamp for latency tracking
         event_type = "transcription" if is_final else "transcription_interim"
         self._emit_event(event_type, {
             "text": text.strip(),
             "language": language or "en",
-            "confidence": float(confidence) if confidence else (1.0 if is_final else 0.8)
+            "confidence": float(confidence) if confidence else (1.0 if is_final else 0.8),
+            "timestamp": time.time(),
+            "is_final": is_final
         })
     
     def _resample_to_24k(self, audio: np.ndarray) -> np.ndarray:
@@ -107,6 +110,11 @@ class AudioPipeline:
                         logger.info("STT stream started")
                         self._emit_event("speech_start", {"timestamp": self.speech_start_time})
                         self.stt_start_failed = False
+                        self.stt_stop_time = None  # Clear cooldown timer on successful start
+                        # Wait a brief moment for STT connection to be fully ready
+                        time.sleep(0.1)
+                        # Reset send counter
+                        self._stt_send_count = 0
                     else:
                         logger.error("Failed to start STT stream")
                         if not self.stt_start_failed:
@@ -118,6 +126,12 @@ class AudioPipeline:
                 # Resample to 24kHz for STT
                 audio_24k = self._resample_to_24k(denoised_audio)
                 # Send audio to STT (it will skip silence internally)
+                # Log first few sends to debug
+                if not hasattr(self, '_stt_send_count'):
+                    self._stt_send_count = 0
+                self._stt_send_count += 1
+                if self._stt_send_count <= 5:
+                    logger.debug(f"[Pipeline] Sending audio chunk {self._stt_send_count} to STT (len={len(audio_24k)}, max={np.abs(audio_24k).max():.6f})")
                 self.streaming_stt.send_audio(audio_24k)
         else:
             self.silence_chunk_count += 1
@@ -129,6 +143,7 @@ class AudioPipeline:
                     self.is_speaking = False
                     duration = time.time() - self.speech_start_time if self.speech_start_time else 0
                     logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
+                    # stop_stream will handle waiting for transcription
                     self.streaming_stt.stop_stream()
                     self.stt_stop_time = time.time()
                     self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})

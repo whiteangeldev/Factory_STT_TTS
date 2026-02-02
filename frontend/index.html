@@ -34,6 +34,10 @@
             </div>
 
             <div class="transcription-container">
+                <div class="transcription-header-bar">
+                    <h3>📝 Live Transcription</h3>
+                    <span id="transcriptionStats" class="transcription-stats">0 transcriptions</span>
+                </div>
                 <div id="transcriptionArea" class="transcription-area">
                     <div class="welcome-message">
                         <p>Click "Start Recording" to begin real-time transcription</p>
@@ -49,6 +53,30 @@
                             <li>Use HTTPS (required for microphone access)</li>
                         </ul>
                     </div>
+                </div>
+            </div>
+
+            <div class="tts-container">
+                <div class="tts-header-bar">
+                    <h3>🔊 Text-to-Speech</h3>
+                </div>
+                <div class="tts-controls">
+                    <div class="tts-input-group">
+                        <label for="ttsText">Text to Speak:</label>
+                        <textarea id="ttsText" class="tts-textarea" placeholder="Enter text to convert to speech..."></textarea>
+                    </div>
+                    <div class="tts-options">
+                        <div class="tts-option-group">
+                            <label for="ttsSpeed">Speed:</label>
+                            <input type="range" id="ttsSpeed" class="tts-speed-slider" min="0.5" max="2.0" step="0.1" value="1.0">
+                            <span id="ttsSpeedValue" class="tts-speed-value">1.0x</span>
+                        </div>
+                    </div>
+                    <div class="tts-buttons">
+                        <button id="ttsPlayBtn" class="btn btn-primary">🔊 Play</button>
+                        <button id="ttsStopBtn" class="btn btn-secondary" disabled>⏹ Stop</button>
+                    </div>
+                    <div id="ttsStatus" class="tts-status"></div>
                 </div>
             </div>
 

@@ -11,3 +11,21 @@ python-dotenv
 setuptools
 sounddevice
 pyaudio
+pyrnnoise
+rnnoise-cli
+requests
+audiolab
+
+# TTS dependencies (optional - install if you want to use TTS feature)
+# For English TTS (MMS-TTS):
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.0.0
+soundfile>=0.12.0
+
+# For Chinese/Japanese TTS (gTTS):
+gtts>=2.3.0
+pydub>=0.25.0
+
+# For speed adjustment:
+librosa>=0.10.0
