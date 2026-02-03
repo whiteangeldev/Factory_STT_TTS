@@ -186,7 +186,7 @@ def synthesize_speech(
     # If MMS-TTS model exists for this language, use it
     if model_id is not None and _HAS_TORCH:
         try:
-            logger.info(f"Using MMS-TTS model for language: {language}")
+            logger.info(f"Using MMS-TTS model for language: {language} (offline-capable)")
             
             # Set up device
             if device_preference == "mps":
@@ -200,8 +200,30 @@ def synthesize_speech(
             else:
                 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
             
-            model = VitsModel.from_pretrained(model_id).to(device)
-            processor = AutoProcessor.from_pretrained(model_id)
+            # Load model with local_files_only=True to use cached model if available
+            # This allows offline operation if model was previously downloaded
+            try:
+                model = VitsModel.from_pretrained(model_id, local_files_only=True).to(device)
+                processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+                logger.debug("Loaded MMS-TTS model from local cache (offline mode)")
+            except (OSError, ValueError) as cache_error:
+                # Model not in cache, try downloading (requires internet)
+                logger.info("Model not in cache, attempting to download (requires internet)...")
+                try:
+                    model = VitsModel.from_pretrained(model_id).to(device)
+                    processor = AutoProcessor.from_pretrained(model_id)
+                    logger.info("Model downloaded and cached successfully")
+                except Exception as download_error:
+                    # Check if it's a network error
+                    error_msg = str(download_error).lower()
+                    if any(keyword in error_msg for keyword in ["connection", "network", "timeout", "unreachable", "offline"]):
+                        raise RuntimeError(
+                            f"MMS-TTS model not found in cache and cannot download (no internet). "
+                            f"Please download the model first with internet: "
+                            f"python -c \"from transformers import VitsModel; VitsModel.from_pretrained('{model_id}')\""
+                        ) from download_error
+                    else:
+                        raise download_error
             inputs = processor(text=text, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
             try:
@@ -238,23 +260,35 @@ def synthesize_speech(
                 if Path(tmp_wav_path).exists():
                     Path(tmp_wav_path).unlink()
                 raise e
+        except RuntimeError as e:
+            # Re-raise RuntimeError (offline errors) so they're handled properly
+            error_msg = str(e).lower()
+            if "not found in cache" in error_msg or "cannot download" in error_msg:
+                raise e
+            else:
+                # Other runtime errors, try to fall through to gTTS if available
+                logger.warning(f"MMS-TTS error: {e}, attempting fallback")
+                pass
         except Exception as e:
             # If model loading fails, fall through to gTTS
-            if "not a valid model identifier" in str(e) or "does not exist" in str(e).lower():
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ["not a valid model identifier", "does not exist"]):
                 logger.info(f"MMS-TTS model not available, falling back to gTTS: {e}")
                 pass  # Fall through to gTTS
             else:
                 raise e
     
     # Fallback to gTTS for Japanese and Chinese (and other unsupported languages)
+    # Note: gTTS requires internet connection
     gtts_lang = GTTS_LANGUAGE_MAP.get(language_lower)
     if gtts_lang and _HAS_GTTS:
-        logger.info(f"Using gTTS for language: {language} (code: {gtts_lang})")
+        logger.info(f"Using gTTS for language: {language} (code: {gtts_lang}) - requires internet")
         # Use gTTS for Japanese and Chinese
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
             tmp_mp3_path = tmp_mp3.name
         
         try:
+            # gTTS requires internet - will raise exception if offline
             tts = gTTS(text=text, lang=gtts_lang, slow=False)
             tts.save(tmp_mp3_path)
             
@@ -329,20 +363,27 @@ def synthesize_speech(
         except Exception as e:
             if Path(tmp_mp3_path).exists():
                 Path(tmp_mp3_path).unlink()
+            # Check if it's a network/connection error
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ["connection", "network", "timeout", "unreachable", "offline", "failed to connect"]):
+                raise RuntimeError(
+                    f"gTTS requires internet connection. Cannot synthesize {language} text offline. "
+                    f"For offline TTS, use English (MMS-TTS) which works without internet after initial model download."
+                ) from e
             raise e
     
     # If we get here, language is not supported or dependencies are missing
     supported = []
     if _HAS_TORCH:
-        supported.append("en/english (MMS-TTS)")
+        supported.append("en/english (MMS-TTS - works offline after model download)")
     if _HAS_GTTS:
-        supported.extend(["ja/japanese (gTTS)", "zh/chinese (gTTS)"])
+        supported.extend(["ja/japanese (gTTS - requires internet)", "zh/chinese (gTTS - requires internet)"])
     
     if not supported:
         raise RuntimeError(
             f"TTS is not available. Install dependencies:\n"
-            f"  - For English: pip install torch transformers datasets soundfile\n"
-            f"  - For Chinese/Japanese: pip install gtts pydub"
+            f"  - For English (offline-capable): pip install torch transformers datasets soundfile\n"
+            f"  - For Chinese/Japanese (requires internet): pip install gtts pydub"
         )
     
     raise ValueError(

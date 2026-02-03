@@ -160,14 +160,18 @@ Server runs on `https://localhost:5421`.
 
 TTS is optional. To enable TTS functionality:
 
-**For Chinese/Japanese TTS (Recommended - Lightweight):**
+**For English TTS (Offline-capable, Recommended):**
 ```bash
-pip install gtts pydub
+# Install dependencies
+pip install torch transformers datasets soundfile
+
+# Pre-download model for offline use (requires internet once)
+python download_tts_model.py
 ```
 
-**For English TTS (Requires PyTorch, ~2GB download):**
+**For Chinese/Japanese TTS (Requires Internet):**
 ```bash
-pip install torch transformers datasets soundfile
+pip install gtts pydub
 ```
 
 **For speed adjustment (Optional):**
@@ -183,7 +187,12 @@ pip install librosa
 **Or install all at once:**
 ```bash
 pip install gtts pydub torch transformers datasets soundfile librosa
+python download_tts_model.py  # Pre-download English model for offline use
 ```
+
+**Offline Operation:**
+- ✅ **English TTS**: Works offline after model is downloaded (run `download_tts_model.py` once with internet)
+- ❌ **Chinese/Japanese TTS**: Requires internet (uses gTTS/Google API)
 
 **Note**: TTS automatically detects language from input text - no manual language selection needed!
 
