@@ -11,12 +11,13 @@ A comprehensive real-time speech-to-text and text-to-speech system with multi-la
 - Real-time audio level monitoring
 
 ### ✅ Milestone 2: Speech-to-Text (STT) Integration
-- OpenAI Realtime API integration for low-latency transcription
+- **Offline Whisper STT** - Fully offline speech recognition using OpenAI Whisper
 - Real-time interim and final transcription display
 - Automatic language detection (English, Chinese, Japanese)
 - Language badge display in transcriptions
 - Confidence scores and latency metrics
 - Optimized for noisy factory conditions
+- Works completely offline after model download
 
 ### ✅ Milestone 3: Language Handling & Text-to-Speech (TTS)
 - Automatic language detection from text input
@@ -62,7 +63,8 @@ Server runs on `https://localhost:5421`.
 - ✅ **Audio Level Monitoring**: Real-time audio level display with RMS and peak levels
 
 ### Speech-to-Text (STT)
-- ✅ **Real-time Transcription**: Low-latency transcription using OpenAI Realtime API
+- ✅ **Offline Transcription**: Fully offline STT using OpenAI Whisper (no internet required)
+- ✅ **Real-time Transcription**: Low-latency transcription with streaming support
 - ✅ **Interim Results**: See transcription as you speak (real-time updates)
 - ✅ **Final Results**: Accurate final transcriptions with confidence scores
 - ✅ **Multi-language Support**: Automatic detection of English, Chinese, and Japanese
@@ -131,30 +133,46 @@ Server runs on `https://localhost:5421`.
 
 - Python 3.8+
 - Modern browser (Chrome/Edge recommended)
-- OpenAI API key (for STT functionality) - Set as environment variable `OPENAI_API_KEY`
+- Whisper model (for STT functionality) - Downloaded automatically on first use, or pre-download with `download_whisper_model.py`
 
 ## Setup & Configuration
 
 ### STT (Speech-to-Text) Setup
 
-1. **Get OpenAI API Key**:
-   - Sign up at [OpenAI](https://platform.openai.com/)
-   - Create an API key in your dashboard
+**Offline Whisper STT (Recommended - Works Offline):**
 
-2. **Set Environment Variable**:
+1. **Install Whisper**:
    ```bash
-   export OPENAI_API_KEY="your-api-key-here"
-   ```
-   
-   Or create a `.env` file in the project root:
-   ```
-   OPENAI_API_KEY=your-api-key-here
+   pip install openai-whisper
    ```
 
-3. **STT Features**:
-   - Automatically detects language (English, Chinese, Japanese)
-   - Low-latency real-time transcription
-   - Works with both microphone and system audio modes
+2. **Pre-download Model (Optional, but recommended)**:
+   ```bash
+   # Download base model (recommended - good balance of speed and accuracy)
+   python download_whisper_model.py --model base
+   
+   # Or download other models:
+   # python download_whisper_model.py --model tiny   # Fastest, lower accuracy
+   # python download_whisper_model.py --model small  # Better accuracy
+   # python download_whisper_model.py --model medium # High accuracy
+   # python download_whisper_model.py --model large   # Highest accuracy
+   ```
+
+3. **Model Sizes**:
+   - **tiny**: ~39MB, fastest, lower accuracy (good for testing)
+   - **base**: ~74MB, fast, good accuracy (**recommended**)
+   - **small**: ~244MB, medium speed, better accuracy
+   - **medium**: ~769MB, slow, high accuracy
+   - **large**: ~1550MB, slowest, highest accuracy
+
+4. **STT Features**:
+   - ✅ **Fully offline** - No internet connection required after model download
+   - ✅ Automatically detects language (English, Chinese, Japanese)
+   - ✅ Low-latency real-time transcription with interim results
+   - ✅ Works with both microphone and system audio modes
+   - ✅ Models are cached locally after first download
+
+**Note**: The model will be downloaded automatically on first use if not pre-downloaded, but this requires an internet connection. Pre-downloading ensures offline operation from the start.
 
 ### TTS (Text-to-Speech) Setup
 
@@ -205,15 +223,25 @@ python download_tts_model.py  # Pre-download English model for offline use
 
 ### STT Issues
 - **No transcriptions appearing**: 
-  - Check that `OPENAI_API_KEY` is set correctly
-  - Verify internet connection (OpenAI API requires network access)
+  - Check that Whisper is installed: `pip install openai-whisper`
+  - Verify model is downloaded (check `~/.cache/whisper/` directory)
+  - Model downloads automatically on first use (requires internet once)
+  - Check server logs for model loading errors
   - Check browser console for errors
 - **Transcriptions cut off**: 
   - Wait for speech to complete - final transcription appears after speech ends
   - Check that audio is being captured properly
+  - Whisper processes audio in chunks, so there may be a slight delay
 - **Wrong language detected**: 
   - Language is auto-detected from audio content
   - For mixed-language audio, the dominant language will be detected
+- **Slow transcription**: 
+  - Use a smaller model (e.g., `tiny` or `base` instead of `large`)
+  - Edit `backend/audio/pipeline.py` to change model size in `WhisperOfflineSTT` initialization
+- **Model download fails**: 
+  - Check internet connection (required only for first download)
+  - Manually download: `python download_whisper_model.py --model base`
+  - Models are cached in `~/.cache/whisper/` after download
 
 ### TTS Issues
 - **TTS not available error**: 

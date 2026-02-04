@@ -818,6 +818,16 @@ class STTApp {
             this.updateSystemStatus('speech_detected', 'Speech Detected');
             this.log('Speech detected', 'success');
         } else if (eventType === 'speech_end') {
+            // Clear VAD state immediately when speech ends
+            this.currentVadState = false;
+            this.vadHistory = [];  // Clear VAD history
+            
+            // Update VAD indicator UI
+            const vadDot = document.getElementById('vadDot');
+            const vadStatus = document.getElementById('vadStatus');
+            if (vadDot) vadDot.classList.remove('active');
+            if (vadStatus) vadStatus.textContent = 'No Speech';
+            
             this.updateSystemStatus('listening', 'Listening...');
             this.log(`Speech ended (duration: ${eventData.duration?.toFixed(2)}s)`, 'info');
         }

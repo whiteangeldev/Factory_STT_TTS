@@ -1,4 +1,4 @@
-"""Audio processing pipeline with VAD, RNNoise, and OpenAI Realtime STT"""
+"""Audio processing pipeline with VAD, RNNoise, and offline Whisper STT"""
 import numpy as np
 import logging
 from typing import Optional, Callable, Dict, Any
@@ -6,7 +6,7 @@ import time
 
 from .vad import VAD
 from .rnnoise import RNNoise
-from .stt_openai_realtime import OpenAIRealtimeSTT
+from .stt_whisper_offline import WhisperOfflineSTT
 from ..config import AudioConfig
 
 logger = logging.getLogger(__name__)
@@ -18,17 +18,17 @@ class AudioPipeline:
         
         self.vad = VAD(config.VAD_AGGRESSIVENESS, config.VAD_FRAME_MS, config.SAMPLE_RATE)
         self.rnnoise = RNNoise(sample_rate=config.SAMPLE_RATE)
-        self.streaming_stt = OpenAIRealtimeSTT(
-            model="gpt-4o-realtime-preview-2024-10-01",
-            sample_rate=24000,
+        self.streaming_stt = WhisperOfflineSTT(
+            model="base",  # Whisper model: "tiny", "base", "small", "medium", "large"
+            sample_rate=16000,  # Whisper uses 16kHz
             on_transcript=self._on_transcript
         )
         
-        self.stt_available = self.streaming_stt.api_key is not None
+        self.stt_available = self.streaming_stt.is_available
         if not self.stt_available:
-            logger.warning("OpenAI Realtime STT not available (API key missing)")
+            logger.warning("Whisper STT not available (install with: pip install openai-whisper)")
         else:
-            logger.info("OpenAI Realtime STT available")
+            logger.info("Whisper offline STT available")
         
         self.is_speaking = False
         self.speech_start_time = None
@@ -40,6 +40,7 @@ class AudioPipeline:
         self.hangover_chunks = int(config.SPEECH_HANGOVER_MS / config.VAD_FRAME_MS)
         self.speech_chunk_count = 0
         self.silence_chunk_count = 0
+        self.speech_pre_buffer = []  # Buffer audio chunks before STT starts to capture beginning
     
     def _emit_event(self, event_type: str, data: Dict[str, Any]):
         if self.event_callback:
@@ -67,10 +68,14 @@ class AudioPipeline:
             "is_final": is_final
         })
     
-    def _resample_to_24k(self, audio: np.ndarray) -> np.ndarray:
-        if self.config.SAMPLE_RATE == 24000:
+    def _resample_to_stt_rate(self, audio: np.ndarray) -> np.ndarray:
+        """Resample audio to STT target rate (16kHz for Whisper)"""
+        target_rate = 16000  # Whisper uses 16kHz
+        
+        if self.config.SAMPLE_RATE == target_rate:
             return audio
-        ratio = 24000 / self.config.SAMPLE_RATE
+        
+        ratio = target_rate / self.config.SAMPLE_RATE
         new_length = int(len(audio) * ratio)
         try:
             from scipy import signal
@@ -91,6 +96,16 @@ class AudioPipeline:
             self.silence_chunk_count = 0
             
             if not self.is_speaking:
+                # Buffer audio chunks before STT starts to capture the beginning of speech
+                audio_16k = self._resample_to_stt_rate(denoised_audio)
+                self.speech_pre_buffer.append(audio_16k)
+                # Keep only recent chunks (last ~1 second worth)
+                max_pre_buffer_samples = int(16000 * 1.0)  # 1 second at 16kHz
+                total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
+                while total_samples > max_pre_buffer_samples and len(self.speech_pre_buffer) > 1:
+                    removed = self.speech_pre_buffer.pop(0)
+                    total_samples -= len(removed)
+                
                 if self.speech_chunk_count >= self.min_speech_chunks:
                     if self.stt_stop_time and (time.time() - self.stt_stop_time) < self.stt_cooldown_seconds:
                         return denoised_audio
@@ -115,35 +130,51 @@ class AudioPipeline:
                         time.sleep(0.1)
                         # Reset send counter
                         self._stt_send_count = 0
+                        
+                        # Send pre-buffered audio chunks first to capture the beginning
+                        if len(self.speech_pre_buffer) > 0:
+                            logger.info(f"Sending {len(self.speech_pre_buffer)} pre-buffered audio chunks to capture speech beginning")
+                            for pre_audio in self.speech_pre_buffer:
+                                self.streaming_stt.send_audio(pre_audio)
+                            self.speech_pre_buffer = []  # Clear after sending
                     else:
                         logger.error("Failed to start STT stream")
                         if not self.stt_start_failed:
                             self.stt_start_failed = True
                         self.is_speaking = False
+                        self.speech_pre_buffer = []  # Clear on failure
                         return denoised_audio
-            
-            if self.is_speaking:
-                # Resample to 24kHz for STT
-                audio_24k = self._resample_to_24k(denoised_audio)
-                # Send audio to STT (it will skip silence internally)
+            else:
+                # Already speaking - send audio normally
+                # Resample to 16kHz for Whisper STT
+                audio_16k = self._resample_to_stt_rate(denoised_audio)
+                # Send audio to STT (it will buffer and process internally)
                 # Log first few sends to debug
                 if not hasattr(self, '_stt_send_count'):
                     self._stt_send_count = 0
                 self._stt_send_count += 1
                 if self._stt_send_count <= 5:
-                    logger.debug(f"[Pipeline] Sending audio chunk {self._stt_send_count} to STT (len={len(audio_24k)}, max={np.abs(audio_24k).max():.6f})")
-                self.streaming_stt.send_audio(audio_24k)
+                    logger.debug(f"[Pipeline] Sending audio chunk {self._stt_send_count} to STT (len={len(audio_16k)}, max={np.abs(audio_16k).max():.6f})")
+                self.streaming_stt.send_audio(audio_16k)
         else:
             self.silence_chunk_count += 1
             if not self.is_speaking:
                 self.speech_chunk_count = 0
+                self.speech_pre_buffer = []  # Clear pre-buffer if speech not confirmed
             
             if self.is_speaking:
                 if self.silence_chunk_count >= self.hangover_chunks:
+                    # Send any remaining audio before stopping (important for capturing end of speech)
+                    audio_16k = self._resample_to_stt_rate(denoised_audio)
+                    self.streaming_stt.send_audio(audio_16k)
+                    
+                    # Small delay to ensure last audio chunk is processed
+                    time.sleep(0.1)
+                    
                     self.is_speaking = False
                     duration = time.time() - self.speech_start_time if self.speech_start_time else 0
                     logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
-                    # stop_stream will handle waiting for transcription
+                    # stop_stream will handle waiting for final transcription
                     self.streaming_stt.stop_stream()
                     self.stt_stop_time = time.time()
                     self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})
@@ -151,8 +182,8 @@ class AudioPipeline:
                     self.silence_chunk_count = 0
                 else:
                     # Continue sending audio during hangover period
-                    audio_24k = self._resample_to_24k(denoised_audio)
-                    self.streaming_stt.send_audio(audio_24k)
+                    audio_16k = self._resample_to_stt_rate(denoised_audio)
+                    self.streaming_stt.send_audio(audio_16k)
         
         return denoised_audio
     
@@ -163,5 +194,6 @@ class AudioPipeline:
         self.speech_start_time = None
         self.speech_chunk_count = 0
         self.silence_chunk_count = 0
+        self.speech_pre_buffer = []
         self.stt_start_failed = False
         self.stt_stop_time = None

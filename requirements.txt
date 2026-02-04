@@ -29,3 +29,6 @@ pydub>=0.25.0
 
 # For speed adjustment:
 librosa>=0.10.0
+
+# For offline STT (Whisper):
+openai-whisper>=20231117
