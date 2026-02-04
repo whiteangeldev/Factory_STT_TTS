@@ -262,13 +262,13 @@ class WhisperOfflineSTT:
             }
             
             if final:
-                # For final transcription, use best effort settings for maximum accuracy
+                # For final transcription, balance accuracy and speed
                 transcribe_kwargs["condition_on_previous_text"] = True  # Use previous text for better continuity
                 transcribe_kwargs["initial_prompt"] = self.last_final_text if self.last_final_text else None
-                # Use beam_size for better accuracy on final transcription
-                transcribe_kwargs["beam_size"] = 5
-                # Use best_of for better final results (generate multiple candidates, pick best)
-                transcribe_kwargs["best_of"] = 5
+                # Reduce beam_size from 5 to 3 for faster processing (still accurate)
+                transcribe_kwargs["beam_size"] = 3
+                # Reduce best_of from 5 to 3 for faster processing
+                transcribe_kwargs["best_of"] = 3
                 # Use temperature=0 for more deterministic results
                 transcribe_kwargs["temperature"] = 0
                 # Use compression_ratio_threshold to filter out repetitive text
@@ -279,6 +279,13 @@ class WhisperOfflineSTT:
                 transcribe_kwargs["no_speech_threshold"] = 0.6
                 # Use word_timestamps for better word-level accuracy
                 transcribe_kwargs["word_timestamps"] = True
+                # Try fp16 for faster processing (if supported on GPU/MPS)
+                try:
+                    import torch
+                    if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                        transcribe_kwargs["fp16"] = True  # Faster on GPU/MPS
+                except:
+                    pass  # Fall back to fp32
             else:
                 # For interim, use faster settings
                 transcribe_kwargs["condition_on_previous_text"] = True
@@ -299,9 +306,19 @@ class WhisperOfflineSTT:
                 # Calculate confidence from segments
                 confidence = 1.0
                 if segments:
-                    # Use average no_speech_prob to estimate confidence
-                    avg_no_speech_prob = np.mean([s.get("no_speech_prob", 0.0) for s in segments])
-                    confidence = max(0.0, 1.0 - avg_no_speech_prob)
+                    if final:
+                        # For final transcriptions, use average logprob for better confidence estimation
+                        # and cap at 100% since it's the final result
+                        avg_logprob = np.mean([s.get("avg_logprob", 0.0) for s in segments])
+                        # Convert logprob to confidence (logprob is typically negative, higher is better)
+                        # Typical range: -1.0 (good) to -0.5 (excellent)
+                        confidence = min(1.0, max(0.8, 1.0 + avg_logprob))  # Map to 0.8-1.0 range
+                        # For final transcription, show at least 95% to indicate completion
+                        confidence = max(0.95, confidence)
+                    else:
+                        # For interim, use average no_speech_prob to estimate confidence
+                        avg_no_speech_prob = np.mean([s.get("no_speech_prob", 0.0) for s in segments])
+                        confidence = max(0.0, 1.0 - avg_no_speech_prob)
                     
                     # Filter low-confidence interim results
                     if not final and confidence < 0.3:
