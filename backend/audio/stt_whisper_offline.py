@@ -222,6 +222,12 @@ class WhisperOfflineSTT:
                 logger.debug(f"Skipping transcription - audio too quiet (max={audio_level:.6f})")
                 return
             
+            # Normalize audio to improve accuracy (prevent clipping and ensure good dynamic range)
+            audio_max = np.abs(audio_data).max()
+            if audio_max > 0:
+                # Normalize to 0.95 peak to avoid clipping while maximizing dynamic range
+                audio_data = audio_data / audio_max * 0.95
+            
             # Resample if needed (Whisper expects 16kHz)
             if self.sample_rate != 16000:
                 try:
@@ -256,15 +262,23 @@ class WhisperOfflineSTT:
             }
             
             if final:
-                # For final transcription, use best effort settings
+                # For final transcription, use best effort settings for maximum accuracy
                 transcribe_kwargs["condition_on_previous_text"] = True  # Use previous text for better continuity
                 transcribe_kwargs["initial_prompt"] = self.last_final_text if self.last_final_text else None
                 # Use beam_size for better accuracy on final transcription
                 transcribe_kwargs["beam_size"] = 5
-                # Use best_of for better final results
+                # Use best_of for better final results (generate multiple candidates, pick best)
                 transcribe_kwargs["best_of"] = 5
                 # Use temperature=0 for more deterministic results
                 transcribe_kwargs["temperature"] = 0
+                # Use compression_ratio_threshold to filter out repetitive text
+                transcribe_kwargs["compression_ratio_threshold"] = 2.4
+                # Use logprob_threshold to filter low-confidence transcriptions
+                transcribe_kwargs["logprob_threshold"] = -1.0
+                # Use no_speech_threshold to better detect speech vs silence
+                transcribe_kwargs["no_speech_threshold"] = 0.6
+                # Use word_timestamps for better word-level accuracy
+                transcribe_kwargs["word_timestamps"] = True
             else:
                 # For interim, use faster settings
                 transcribe_kwargs["condition_on_previous_text"] = True
