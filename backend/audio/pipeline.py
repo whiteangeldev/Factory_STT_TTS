@@ -168,18 +168,37 @@ class AudioPipeline:
                     audio_16k = self._resample_to_stt_rate(denoised_audio)
                     self.streaming_stt.send_audio(audio_16k)
                     
-                    # Small delay to ensure last audio chunk is processed
-                    time.sleep(0.1)
+                    # Mark that we're about to stop, but continue sending a few more chunks
+                    # to ensure we capture the very end of speech
+                    if not hasattr(self, '_stopping_stt'):
+                        self._stopping_stt = True
+                        self._stopping_chunks = 0
+                        logger.info("Starting extended stopping period to capture end of speech")
                     
-                    self.is_speaking = False
-                    duration = time.time() - self.speech_start_time if self.speech_start_time else 0
-                    logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
-                    # stop_stream will handle waiting for final transcription
-                    self.streaming_stt.stop_stream()
-                    self.stt_stop_time = time.time()
-                    self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})
-                    self.speech_chunk_count = 0
-                    self.silence_chunk_count = 0
+                    self._stopping_chunks += 1
+                    
+                    # Send a few more chunks after hangover to capture trailing speech
+                    if self._stopping_chunks <= 8:  # Send 8 more chunks after hangover (increased from 5)
+                        # Continue sending during this extended period - already sent above
+                        pass
+                    else:
+                        # Now actually stop - set is_speaking to False FIRST so processed_audio events reflect silence
+                        self.is_speaking = False
+                        
+                        # Longer delay to ensure last audio chunks are queued and processed
+                        time.sleep(0.5)  # Increased from 0.3
+                        
+                        duration = time.time() - self.speech_start_time if self.speech_start_time else 0
+                        logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
+                        # stop_stream will handle waiting for final transcription
+                        self.streaming_stt.stop_stream()
+                        self.stt_stop_time = time.time()
+                        self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})
+                        self.speech_chunk_count = 0
+                        self.silence_chunk_count = 0
+                        self._stopping_stt = False
+                        if hasattr(self, '_stopping_chunks'):
+                            delattr(self, '_stopping_chunks')
                 else:
                     # Continue sending audio during hangover period
                     audio_16k = self._resample_to_stt_rate(denoised_audio)

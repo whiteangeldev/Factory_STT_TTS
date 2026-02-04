@@ -112,6 +112,10 @@ class WhisperOfflineSTT:
     
     def stop_stream(self):
         """Stop STT stream and process remaining audio"""
+        # First, give a moment for any pending audio chunks to be added to buffer
+        # Increased wait to ensure all chunks from extended stopping period are added
+        time.sleep(0.8)  # Increased from 0.5 to ensure all chunks are added
+        
         with self.buffer_lock:
             if not self.is_streaming:
                 return
@@ -120,15 +124,18 @@ class WhisperOfflineSTT:
             
             # Process any remaining audio in buffer
             if len(self.audio_buffer) > 0:
-                logger.info(f"Processing final buffer with {len(self.audio_buffer)} chunks ({sum(len(chunk) for chunk in self.audio_buffer)/self.sample_rate:.2f}s)")
+                buffer_duration = sum(len(chunk) for chunk in self.audio_buffer) / self.sample_rate
+                logger.info(f"Processing final buffer with {len(self.audio_buffer)} chunks ({buffer_duration:.2f}s)")
+                # Process final buffer WITHOUT clearing it first - process all accumulated audio
                 self._process_buffer(final=True)
+            else:
+                logger.warning("Final buffer is empty - no audio to process")
             
-            self.audio_buffer = []
+            # Clear buffer AFTER processing (done in _process_buffer for final=True)
         
         # Wait for processing thread to finish and for final transcription to be sent
         # This ensures we capture the complete transcription including the end
-        max_wait = 5.0  # Wait up to 5 seconds for final transcription
-        wait_interval = 0.2
+        max_wait = 8.0  # Increased wait time for final transcription
         waited = 0.0
         
         # Wait for processing thread to finish
@@ -140,13 +147,17 @@ class WhisperOfflineSTT:
         # (transcription processing happens in the thread, callback might take a moment)
         if waited < max_wait:
             remaining_wait = max_wait - waited
-            time.sleep(min(remaining_wait, 1.0))  # Wait up to 1 more second
+            time.sleep(min(remaining_wait, 2.0))  # Wait up to 2 more seconds
         
         logger.info("Whisper STT stream stopped")
     
     def send_audio(self, audio: np.ndarray):
         """Add audio chunk to buffer"""
-        if not self.is_streaming or self.model is None:
+        if self.model is None:
+            return
+        
+        # Check if streaming - if not, don't accept new audio
+        if not self.is_streaming:
             return
         
         if len(audio) == 0:
@@ -171,7 +182,7 @@ class WhisperOfflineSTT:
             buffer_samples = sum(len(chunk) for chunk in self.audio_buffer)
             buffer_duration = buffer_samples / self.sample_rate
             
-            # Force processing if buffer is too large
+            # Force processing if buffer is too large (but don't clear buffer - keep all for final)
             if buffer_duration >= self.max_buffer_duration:
                 self._process_buffer(final=False)
     
@@ -194,8 +205,13 @@ class WhisperOfflineSTT:
                 time_since_last = time.time() - self.last_transcription_time if self.last_transcription_time else float('inf')
                 
                 # Increased interval for interim results
+                # Only process interim if buffer is getting large (to avoid too frequent processing)
+                # This ensures we keep all audio for the final transcription
                 if buffer_duration >= self.min_buffer_duration and time_since_last >= self.interim_interval:
-                    self._process_buffer(final=False)
+                    # Only process interim if buffer is getting large (>= 3 seconds)
+                    # This prevents clearing buffer too early and losing end of speech
+                    if buffer_duration >= 3.0:
+                        self._process_buffer(final=False)
     
     def _process_buffer(self, final=False):
         """Process audio buffer and generate transcription"""
@@ -228,6 +244,15 @@ class WhisperOfflineSTT:
                     indices = np.linspace(0, len(audio_data) - 1, int(len(audio_data) * ratio))
                     audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data).astype(np.float32)
             
+            # For final transcription, add small silence padding at the end
+            # This helps Whisper capture the last word more accurately
+            if final:
+                # Add 0.3 seconds of silence at the end (helps Whisper detect end of speech)
+                silence_padding = int(0.3 * 16000)  # 0.3 seconds at 16kHz
+                padding = np.zeros(silence_padding, dtype=np.float32)
+                audio_data = np.concatenate([audio_data, padding])
+                logger.debug(f"Added {silence_padding/16000:.2f}s silence padding for final transcription")
+            
             # Transcribe using Whisper with better settings
             logger.debug(f"Processing {len(audio_data)/16000:.2f}s of audio (final={final})")
             
@@ -245,6 +270,10 @@ class WhisperOfflineSTT:
                 transcribe_kwargs["initial_prompt"] = self.last_final_text if self.last_final_text else None
                 # Use beam_size for better accuracy on final transcription
                 transcribe_kwargs["beam_size"] = 5
+                # Use best_of for better final results
+                transcribe_kwargs["best_of"] = 5
+                # Use temperature=0 for more deterministic results
+                transcribe_kwargs["temperature"] = 0
             else:
                 # For interim, use faster settings
                 transcribe_kwargs["condition_on_previous_text"] = True
@@ -307,24 +336,12 @@ class WhisperOfflineSTT:
             # Clear buffer after processing (but keep streaming for more audio)
             with self.buffer_lock:
                 if not final:
-                    # For interim, keep last 1.5 seconds for continuity (increased from 0.5)
-                    keep_samples = int(self.sample_rate * 1.5)
-                    total_samples = sum(len(chunk) for chunk in self.audio_buffer)
-                    if total_samples > keep_samples:
-                        # Keep only the last portion
-                        samples_to_keep = 0
-                        new_buffer = []
-                        for chunk in reversed(self.audio_buffer):
-                            if samples_to_keep >= keep_samples:
-                                break
-                            new_buffer.insert(0, chunk)
-                            samples_to_keep += len(chunk)
-                        self.audio_buffer = new_buffer
-                    else:
-                        # Keep all if less than keep_samples
-                        pass
+                    # For interim, DON'T clear buffer - keep ALL audio for final transcription
+                    # This ensures we don't lose the end of speech
+                    # Only update the last transcription time
+                    pass
                 else:
-                    # For final, clear everything
+                    # For final, clear buffer after processing
                     self.audio_buffer = []
                 
                 self.last_transcription_time = time.time()

@@ -131,8 +131,11 @@ class STTApp {
         });
         
         this.socket.on('speech_event', (data) => {
-            console.log('🔊 Received speech_event:', data.event, data.data);
-            this.handleSpeechEvent(data);
+            console.log('🔊 Received speech_event:', data);
+            // Handle both nested and flat structures
+            const eventType = data.event || data.type;
+            const eventData = data.data || {};
+            this.handleSpeechEvent({ event: eventType, data: eventData });
         });
         
         this.socket.on('transcription', (data) => {
@@ -717,6 +720,31 @@ class STTApp {
         const vadStatus = document.getElementById('vadStatus');
         
         if (data.has_speech !== undefined) {
+            // If speech_end event was received, force silence state
+            if (this._speechEnded) {
+                // Reset flag after a few silence chunks
+                if (!data.has_speech && data.speech_state === 'silence') {
+                    if (!this._speechEndedCount) this._speechEndedCount = 0;
+                    this._speechEndedCount++;
+                    if (this._speechEndedCount >= 3) {
+                        this._speechEnded = false;
+                        this._speechEndedCount = 0;
+                    }
+                }
+                // Force silence state
+                if (this.currentVadState) {
+                    this.currentVadState = false;
+                    const vadDot = document.getElementById('vadDot');
+                    const vadStatus = document.getElementById('vadStatus');
+                    if (vadDot) vadDot.classList.remove('active');
+                    if (vadStatus) {
+                        vadStatus.textContent = 'No Speech';
+                        vadStatus.style.color = '#666';
+                    }
+                }
+                return;  // Skip smoothing logic when speech has ended
+            }
+            
             // Add to history (keep last 5 chunks)
             this.vadHistory.push(data.has_speech);
             if (this.vadHistory.length > 5) {
@@ -818,15 +846,20 @@ class STTApp {
             this.updateSystemStatus('speech_detected', 'Speech Detected');
             this.log('Speech detected', 'success');
         } else if (eventType === 'speech_end') {
-            // Clear VAD state immediately when speech ends
+            // Force clear VAD state immediately when speech ends
+            // Set a flag to prevent smoothing from overriding this
+            this._speechEnded = true;
             this.currentVadState = false;
             this.vadHistory = [];  // Clear VAD history
             
-            // Update VAD indicator UI
+            // Update VAD indicator UI immediately
             const vadDot = document.getElementById('vadDot');
             const vadStatus = document.getElementById('vadStatus');
             if (vadDot) vadDot.classList.remove('active');
-            if (vadStatus) vadStatus.textContent = 'No Speech';
+            if (vadStatus) {
+                vadStatus.textContent = 'No Speech';
+                vadStatus.style.color = '#666';
+            }
             
             this.updateSystemStatus('listening', 'Listening...');
             this.log(`Speech ended (duration: ${eventData.duration?.toFixed(2)}s)`, 'info');
