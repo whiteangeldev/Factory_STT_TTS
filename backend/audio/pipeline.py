@@ -41,6 +41,8 @@ class AudioPipeline:
         self.speech_chunk_count = 0
         self.silence_chunk_count = 0
         self.speech_pre_buffer = []  # Buffer audio chunks before STT starts to capture beginning
+        self._stopping_stt = False
+        self._stopping_chunks = 0
     
     def _emit_event(self, event_type: str, data: Dict[str, Any]):
         if self.event_callback:
@@ -99,8 +101,8 @@ class AudioPipeline:
                 # Buffer audio chunks before STT starts to capture the beginning of speech
                 audio_16k = self._resample_to_stt_rate(denoised_audio)
                 self.speech_pre_buffer.append(audio_16k)
-                # Keep only recent chunks (last ~1 second worth)
-                max_pre_buffer_samples = int(16000 * 1.0)  # 1 second at 16kHz
+                # Keep more chunks (last ~2 seconds worth) to ensure we capture the beginning
+                max_pre_buffer_samples = int(16000 * 2.0)  # 2 seconds at 16kHz (increased from 1.0)
                 total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
                 while total_samples > max_pre_buffer_samples and len(self.speech_pre_buffer) > 1:
                     removed = self.speech_pre_buffer.pop(0)
@@ -133,10 +135,20 @@ class AudioPipeline:
                         
                         # Send pre-buffered audio chunks first to capture the beginning
                         if len(self.speech_pre_buffer) > 0:
-                            logger.info(f"Sending {len(self.speech_pre_buffer)} pre-buffered audio chunks to capture speech beginning")
+                            pre_buffer_duration = sum(len(chunk) for chunk in self.speech_pre_buffer) / 16000
+                            logger.info(f"Sending {len(self.speech_pre_buffer)} pre-buffered audio chunks ({pre_buffer_duration:.2f}s) to capture speech beginning")
+                            # Send all pre-buffered chunks
                             for pre_audio in self.speech_pre_buffer:
                                 self.streaming_stt.send_audio(pre_audio)
                             self.speech_pre_buffer = []  # Clear after sending
+                            # Small delay to ensure pre-buffered chunks are processed
+                            time.sleep(0.05)
+                        
+                        # CRITICAL: Also send the current chunk that triggered speech detection
+                        # This ensures we don't lose the chunk that contains the beginning of speech
+                        current_audio_16k = self._resample_to_stt_rate(denoised_audio)
+                        self.streaming_stt.send_audio(current_audio_16k)
+                        logger.debug(f"Sent current chunk after pre-buffer (len={len(current_audio_16k)})")
                     else:
                         logger.error("Failed to start STT stream")
                         if not self.stt_start_failed:
@@ -170,7 +182,7 @@ class AudioPipeline:
                     
                     # Mark that we're about to stop, but continue sending a few more chunks
                     # to ensure we capture the very end of speech
-                    if not hasattr(self, '_stopping_stt'):
+                    if not self._stopping_stt:
                         self._stopping_stt = True
                         self._stopping_chunks = 0
                         logger.info("Starting extended stopping period to capture end of speech")
@@ -178,7 +190,7 @@ class AudioPipeline:
                     self._stopping_chunks += 1
                     
                     # Send a few more chunks after hangover to capture trailing speech
-                    if self._stopping_chunks <= 8:  # Send 8 more chunks after hangover (increased from 5)
+                    if self._stopping_chunks <= 10:  # Send 10 more chunks after hangover (increased from 8)
                         # Continue sending during this extended period - already sent above
                         pass
                     else:
@@ -186,7 +198,7 @@ class AudioPipeline:
                         self.is_speaking = False
                         
                         # Longer delay to ensure last audio chunks are queued and processed
-                        time.sleep(0.5)  # Increased from 0.3
+                        time.sleep(0.7)  # Increased from 0.5 to ensure all chunks are sent
                         
                         duration = time.time() - self.speech_start_time if self.speech_start_time else 0
                         logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
@@ -197,8 +209,7 @@ class AudioPipeline:
                         self.speech_chunk_count = 0
                         self.silence_chunk_count = 0
                         self._stopping_stt = False
-                        if hasattr(self, '_stopping_chunks'):
-                            delattr(self, '_stopping_chunks')
+                        self._stopping_chunks = 0
                 else:
                     # Continue sending audio during hangover period
                     audio_16k = self._resample_to_stt_rate(denoised_audio)
@@ -216,3 +227,5 @@ class AudioPipeline:
         self.speech_pre_buffer = []
         self.stt_start_failed = False
         self.stt_stop_time = None
+        self._stopping_stt = False
+        self._stopping_chunks = 0
