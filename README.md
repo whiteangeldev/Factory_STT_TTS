@@ -15,18 +15,20 @@ A comprehensive real-time speech-to-text and text-to-speech system with multi-la
 - Real-time interim and final transcription display
 - Automatic language detection (English, Chinese, Japanese)
 - Language badge display in transcriptions
-- Confidence scores and latency metrics
+- Confidence scores (95-100% for final transcriptions) and latency metrics
+- Optimized for speed and accuracy (beam_size=3, best_of=3, fp16 acceleration)
 - Optimized for noisy factory conditions
 - Works completely offline after model download
 
 ### ✅ Milestone 3: Language Handling & Text-to-Speech (TTS)
 - Automatic language detection from text input
-- Multi-language TTS support:
-  - **English**: MMS-TTS (PyTorch-based)
-  - **Chinese**: gTTS (Google Text-to-Speech)
-  - **Japanese**: gTTS (Google Text-to-Speech)
+- Multi-language TTS support (all offline-capable after initial download):
+  - **English**: MMS-TTS (PyTorch-based, neural TTS)
+  - **Chinese**: Piper TTS (offline, fast, high-quality)
+  - **Japanese**: PyKokoro (offline, neural TTS, natural-sounding)
 - Adjustable playback speed (0.5x - 2.0x)
 - Real-time audio playback in browser
+- Model caching for fast subsequent requests
 
 ## Quick Start
 
@@ -64,20 +66,22 @@ Server runs on `https://localhost:5421`.
 
 ### Speech-to-Text (STT)
 - ✅ **Offline Transcription**: Fully offline STT using OpenAI Whisper (no internet required)
-- ✅ **Real-time Transcription**: Low-latency transcription with streaming support
+- ✅ **Real-time Transcription**: Low-latency transcription with streaming support (optimized for speed)
 - ✅ **Interim Results**: See transcription as you speak (real-time updates)
-- ✅ **Final Results**: Accurate final transcriptions with confidence scores
+- ✅ **Final Results**: Accurate final transcriptions with confidence scores (95-100%)
 - ✅ **Multi-language Support**: Automatic detection of English, Chinese, and Japanese
 - ✅ **Language Badges**: Visual indicators showing detected language (🇬🇧 English, 🇨🇳 Chinese, 🇯🇵 Japanese)
 - ✅ **Latency Metrics**: Track transcription latency for performance monitoring
-- ✅ **Confidence Scores**: Display transcription confidence levels
+- ✅ **Confidence Scores**: Display transcription confidence levels (optimized calculation for final results)
 
 ### Text-to-Speech (TTS)
 - ✅ **Automatic Language Detection**: Detects language from input text automatically
-- ✅ **Multi-language TTS**: Supports English, Chinese, and Japanese
+- ✅ **Multi-language TTS**: Supports English, Chinese, and Japanese (all offline-capable)
+- ✅ **Offline Operation**: All TTS engines work completely offline after initial model download
 - ✅ **Adjustable Speed**: Control playback speed from 0.5x to 2.0x
 - ✅ **Real-time Playback**: Instant audio playback in browser
-- ✅ **High-quality Voices**: Natural-sounding speech synthesis
+- ✅ **High-quality Voices**: Natural-sounding neural speech synthesis
+- ✅ **Model Caching**: Fast subsequent requests with in-memory model caching
 
 ## Usage
 
@@ -98,7 +102,7 @@ Server runs on `https://localhost:5421`.
    - See real-time interim transcriptions as you speak (marked with "⟳ Processing")
    - Final transcriptions appear when speech ends (marked with "✓ Final")
    - Language badges show detected language automatically
-   - Confidence scores and latency metrics are displayed
+   - Confidence scores (95-100% for final transcriptions) and latency metrics are displayed
 
 4. **Stop Recording**: Click **"Stop Recording"** when done
 
@@ -148,29 +152,35 @@ Server runs on `https://localhost:5421`.
 
 2. **Pre-download Model (Optional, but recommended)**:
    ```bash
-   # Download base model (recommended - good balance of speed and accuracy)
-   python download_whisper_model.py --model base
+   # Download small model (default - optimized for accuracy and speed)
+   python download_whisper_model.py --model small
    
    # Or download other models:
    # python download_whisper_model.py --model tiny   # Fastest, lower accuracy
-   # python download_whisper_model.py --model small  # Better accuracy
-   # python download_whisper_model.py --model medium # High accuracy
-   # python download_whisper_model.py --model large   # Highest accuracy
+   # python download_whisper_model.py --model base   # Fast, good accuracy
+   # python download_whisper_model.py --model small  # Better accuracy (default)
+   # python download_whisper_model.py --model medium # High accuracy, slower
+   # python download_whisper_model.py --model large   # Highest accuracy, slowest
    ```
 
 3. **Model Sizes**:
    - **tiny**: ~39MB, fastest, lower accuracy (good for testing)
-   - **base**: ~74MB, fast, good accuracy (**recommended**)
-   - **small**: ~244MB, medium speed, better accuracy
-   - **medium**: ~769MB, slow, high accuracy
-   - **large**: ~1550MB, slowest, highest accuracy
+   - **base**: ~74MB, fast, good accuracy
+   - **small**: ~244MB, optimized speed/accuracy balance (**default, recommended**)
+   - **medium**: ~769MB, high accuracy, slower
+   - **large**: ~1550MB, highest accuracy, slowest
+   
+   **Note**: The default model is `small`, which is optimized with `beam_size=3`, `best_of=3`, and `fp16` acceleration (if available) for the best balance of speed and accuracy.
 
 4. **STT Features**:
    - ✅ **Fully offline** - No internet connection required after model download
    - ✅ Automatically detects language (English, Chinese, Japanese)
-   - ✅ Low-latency real-time transcription with interim results
+   - ✅ Low-latency real-time transcription with interim results (optimized for speed)
    - ✅ Works with both microphone and system audio modes
    - ✅ Models are cached locally after first download
+   - ✅ Optimized transcription parameters for speed (beam_size=3, best_of=3)
+   - ✅ GPU/MPS acceleration support (fp16) for faster processing when available
+   - ✅ Accurate confidence scoring (95-100% for final transcriptions)
 
 **Note**: The model will be downloaded automatically on first use if not pre-downloaded, but this requires an internet connection. Pre-downloading ensures offline operation from the start.
 
@@ -178,39 +188,39 @@ Server runs on `https://localhost:5421`.
 
 TTS is optional. To enable TTS functionality:
 
-**For English TTS (Offline-capable, Recommended):**
+**Install all TTS dependencies:**
 ```bash
-# Install dependencies
-pip install torch transformers datasets soundfile
-
-# Pre-download model for offline use (requires internet once)
-python download_tts_model.py
+pip install -r requirements.txt
 ```
 
-**For Chinese/Japanese TTS (Requires Internet):**
+**Pre-download models for offline use (requires internet once):**
 ```bash
-pip install gtts pydub
+# Download all models (English, Chinese, Japanese)
+python download_tts_model.py --lang all
+
+# Or download individually:
+python download_tts_model.py --lang en  # English (MMS-TTS)
+python download_tts_model.py --lang zh  # Chinese (Piper TTS)
+python download_tts_model.py --lang ja  # Japanese (PyKokoro)
 ```
 
-**For speed adjustment (Optional):**
-```bash
-pip install librosa
-```
+**TTS Engines:**
+- ✅ **English**: MMS-TTS (PyTorch-based, neural TTS) - Offline after download
+- ✅ **Chinese**: Piper TTS (fast, high-quality) - Offline after download
+- ✅ **Japanese**: PyKokoro (neural TTS, natural-sounding) - Offline after download
 
-**Quick install script:**
+**Additional dependencies for Japanese TTS:**
 ```bash
-./install_tts.sh
-```
-
-**Or install all at once:**
-```bash
-pip install gtts pydub torch transformers datasets soundfile librosa
-python download_tts_model.py  # Pre-download English model for offline use
+# PyKokoro requires spaCy language models
+pip install spacy
+python -m spacy download en_core_web_sm  # Required
+python -m spacy download ja_core_news_sm  # Recommended for better Japanese processing
 ```
 
 **Offline Operation:**
-- ✅ **English TTS**: Works offline after model is downloaded (run `download_tts_model.py` once with internet)
-- ❌ **Chinese/Japanese TTS**: Requires internet (uses gTTS/Google API)
+- ✅ **All TTS engines**: Work completely offline after initial model download
+- ✅ **Model caching**: Models are cached in memory for fast subsequent requests
+- ✅ **No internet required**: After initial setup, all TTS works without internet
 
 **Note**: TTS automatically detects language from input text - no manual language selection needed!
 
@@ -232,12 +242,15 @@ python download_tts_model.py  # Pre-download English model for offline use
   - Wait for speech to complete - final transcription appears after speech ends
   - Check that audio is being captured properly
   - Whisper processes audio in chunks, so there may be a slight delay
+  - The system uses pre-buffering and extended stopping periods to capture complete speech
 - **Wrong language detected**: 
   - Language is auto-detected from audio content
   - For mixed-language audio, the dominant language will be detected
 - **Slow transcription**: 
-  - Use a smaller model (e.g., `tiny` or `base` instead of `large`)
+  - The default `small` model is already optimized for speed (beam_size=3, best_of=3)
+  - Use a smaller model (e.g., `tiny` or `base` instead of `small`) for even faster processing
   - Edit `backend/audio/pipeline.py` to change model size in `WhisperOfflineSTT` initialization
+  - GPU/MPS acceleration (fp16) is automatically enabled if available for faster processing
 - **Model download fails**: 
   - Check internet connection (required only for first download)
   - Manually download: `python download_whisper_model.py --model base`
@@ -245,7 +258,8 @@ python download_tts_model.py  # Pre-download English model for offline use
 
 ### TTS Issues
 - **TTS not available error**: 
-  - Install TTS dependencies (see TTS Setup section)
+  - Install TTS dependencies: `pip install -r requirements.txt`
+  - For Japanese: Install spaCy models: `pip install spacy && python -m spacy download en_core_web_sm`
   - Restart server after installing dependencies
 - **No audio playback**: 
   - Check browser console for errors
@@ -253,5 +267,14 @@ python download_tts_model.py  # Pre-download English model for offline use
   - Try a different browser (Chrome/Edge recommended)
 - **Wrong language for TTS**: 
   - Language is automatically detected from text
-  - Chinese/Japanese characters will use gTTS
-  - English text will use MMS-TTS (if installed) or gTTS
+  - English text uses MMS-TTS (offline)
+  - Chinese text uses Piper TTS (offline)
+  - Japanese text uses PyKokoro (offline)
+- **Model download errors**:
+  - Ensure internet connection for initial download
+  - Run `python download_tts_model.py --lang <language>` to pre-download models
+  - Models are cached locally after download for offline use
+- **Japanese TTS not working**:
+  - Ensure PyKokoro is installed: `pip install pykokoro`
+  - Install spaCy models: `python -m spacy download en_core_web_sm`
+  - Check server logs for specific error messages

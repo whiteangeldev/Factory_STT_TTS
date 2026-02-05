@@ -446,6 +446,8 @@ def _process_audio_chunk(client_id, audio_to_process):
     audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
     
     # Debug: Log emission attempt
+    if not hasattr(_process_audio_chunk, '_emit_count'):
+        _process_audio_chunk._emit_count = {}
     if client_id not in _process_audio_chunk._emit_count:
         _process_audio_chunk._emit_count[client_id] = 0
     _process_audio_chunk._emit_count[client_id] += 1

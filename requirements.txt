@@ -17,15 +17,23 @@ requests
 audiolab
 
 # TTS dependencies (optional - install if you want to use TTS feature)
-# For English TTS (MMS-TTS):
+# All TTS engines are offline-capable after initial model download
+# For English TTS (MMS-TTS - offline-capable):
 torch>=2.0.0
 transformers>=4.30.0
 datasets>=2.0.0
 soundfile>=0.12.0
 
-# For Chinese/Japanese TTS (gTTS):
-gtts>=2.3.0
-pydub>=0.25.0
+# For Chinese TTS (Piper TTS - offline-capable):
+piper-tts>=1.2.0
+huggingface_hub>=0.20.0
+g2pw>=0.1.0  # Required for Chinese phonemization in Piper TTS
+unicode-rbnf>=0.9.0  # Required for Chinese number formatting in Piper TTS
+sentence-stream>=0.1.0  # Required for Chinese sentence processing in Piper TTS
+
+# For Japanese TTS (PyKokoro - offline-capable, alternative to MMS/OpenJTalk/Piper):
+pykokoro>=1.0.0
+spacy>=3.7.0  # Required by PyKokoro for text processing
 
 # For speed adjustment:
 librosa>=0.10.0
