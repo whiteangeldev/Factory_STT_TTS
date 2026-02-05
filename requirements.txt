@@ -24,16 +24,17 @@ transformers>=4.30.0
 datasets>=2.0.0
 soundfile>=0.12.0
 
-# For Chinese TTS (Piper TTS - offline-capable):
-piper-tts>=1.2.0
-huggingface_hub>=0.20.0
-g2pw>=0.1.0  # Required for Chinese phonemization in Piper TTS
-unicode-rbnf>=0.9.0  # Required for Chinese number formatting in Piper TTS
-sentence-stream>=0.1.0  # Required for Chinese sentence processing in Piper TTS
+# For Chinese TTS (PyKokoro - offline-capable, faster than Piper):
+# Uses same dependencies as Japanese (pykokoro, spacy)
+# No longer using Piper TTS for Chinese (removed g2pw, unicode-rbnf, sentence-stream dependencies)
 
-# For Japanese TTS (PyKokoro - offline-capable, alternative to MMS/OpenJTalk/Piper):
+# For Japanese/Chinese TTS (PyKokoro - offline-capable, alternative to MMS/OpenJTalk/Piper):
 pykokoro>=1.0.0
 spacy>=3.7.0  # Required by PyKokoro for text processing
+cn2an>=0.5.17  # Required by PyKokoro for Chinese number conversion
+jieba>=0.42.1  # Required by PyKokoro for Chinese word segmentation
+ordered_set
+pypinyin
 
 # For speed adjustment:
 librosa>=0.10.0

@@ -9,16 +9,7 @@ import shutil
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Piper TTS voice mapping
-PIPER_TTS_VOICES = {
-    # Chinese voices
-    "zh": "zh_CN/xiaoyan/medium",
-    "cmn": "zh_CN/xiaoyan/medium",
-    "zho": "zh_CN/xiaoyan/medium",
-    "chinese": "zh_CN/xiaoyan/medium",
-    "mandarin": "zh_CN/xiaoyan/medium",
-    "zh-cn": "zh_CN/xiaoyan/medium",
-}
+# Piper TTS removed - Chinese now uses PyKokoro (faster, no g2pw overhead)
 
 def download_mms_tts_model(model_id="facebook/mms-tts-eng", language_name="English"):
     """Download MMS-TTS model for offline use"""
@@ -55,20 +46,13 @@ def download_mms_tts_model(model_id="facebook/mms-tts-eng", language_name="Engli
             logger.error("Network error - please check your internet connection")
         return False
 
-def download_pykokoro_japanese():
-    """Download PyKokoro Japanese model for offline use"""
-    try:
-        from pykokoro import build_pipeline
-    except ImportError:
-        logger.error("PyKokoro not installed. Install with: pip install pykokoro")
-        return False
-    
-    # Check and download spaCy models if needed
+def _download_spacy_models():
+    """Download required spaCy models for PyKokoro"""
     try:
         import spacy
         logger.info("Checking spaCy language models...")
         
-        # Check for English model
+        # Check for English model (required)
         try:
             spacy.load("en_core_web_sm")
             logger.info("✓ English spaCy model (en_core_web_sm) found")
@@ -78,7 +62,29 @@ def download_pykokoro_japanese():
             subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
             logger.info("✓ English spaCy model downloaded")
         
-        # Check for Japanese model (optional but recommended)
+        return True
+    except ImportError:
+        logger.error("spaCy not installed. Install with: pip install spacy")
+        return False
+    except Exception as e:
+        logger.warning(f"spaCy model check failed: {e}, continuing anyway...")
+        return True
+
+def download_pykokoro_japanese():
+    """Download PyKokoro Japanese model for offline use"""
+    try:
+        from pykokoro import build_pipeline, PipelineConfig, GenerationConfig
+    except ImportError:
+        logger.error("PyKokoro not installed. Install with: pip install pykokoro")
+        return False
+    
+    # Download spaCy models
+    if not _download_spacy_models():
+        return False
+    
+    # Check for Japanese model (optional but recommended)
+    try:
+        import spacy
         try:
             spacy.load("ja_core_news_sm")
             logger.info("✓ Japanese spaCy model (ja_core_news_sm) found")
@@ -90,24 +96,20 @@ def download_pykokoro_japanese():
                 logger.info("✓ Japanese spaCy model downloaded")
             except subprocess.CalledProcessError:
                 logger.warning("Japanese spaCy model download failed (optional, continuing anyway)")
-        
-    except ImportError:
-        logger.error("spaCy not installed. Install with: pip install spacy")
-        logger.info("Then download models: python -m spacy download en_core_web_sm")
-        return False
-    except Exception as e:
-        logger.warning(f"spaCy model check failed: {e}, continuing anyway...")
+    except Exception:
+        pass
     
     try:
-        logger.info("Initializing PyKokoro pipeline (will download models if needed)...")
+        logger.info("Initializing PyKokoro pipeline for Japanese (will download models if needed)...")
         logger.info("This may take a few minutes and requires internet connection...")
         
-        # Initialize PyKokoro pipeline (will download models automatically)
-        pipeline = build_pipeline()
+        # Initialize PyKokoro pipeline with Japanese config
+        config = PipelineConfig(generation=GenerationConfig(lang='ja'))
+        pipeline = build_pipeline(config=config)
         
         # Test with a simple Japanese text to trigger model download
         try:
-            test_result = pipeline.run("こんにちは")
+            test_result = pipeline.run("こんにちは", generation=GenerationConfig(lang='ja'))
             logger.info(f"✓ Test synthesis successful (sample rate: {test_result.sample_rate} Hz)")
         except Exception as test_error:
             logger.warning(f"Test synthesis had issues: {test_error}")
@@ -129,116 +131,93 @@ def download_pykokoro_japanese():
             logger.error("  python -m spacy download ja_core_news_sm")
         return False
 
-def download_piper_tts_voice(lang_code: str):
-    """Download Piper TTS voice for a specific language"""
+def download_pykokoro_chinese():
+    """Download PyKokoro Chinese model for offline use"""
     try:
-        from huggingface_hub import hf_hub_download
+        from pykokoro import build_pipeline, PipelineConfig, GenerationConfig
     except ImportError:
-        logger.error("huggingface_hub not installed. Install with: pip install huggingface_hub")
+        logger.error("PyKokoro not installed. Install with: pip install pykokoro")
         return False
     
-    voice_name = PIPER_TTS_VOICES.get(lang_code.lower())
-    if not voice_name:
-        logger.error(f"Unsupported language code for Piper TTS: {lang_code}")
-        logger.info("Supported languages: zh (Chinese), ja (Japanese), or their variants")
+    # Check for cn2an (required for Chinese number conversion)
+    try:
+        import cn2an
+        logger.info("✓ cn2an module found (required for Chinese number conversion)")
+    except ImportError:
+        logger.error("cn2an not installed. Install with: pip install cn2an")
+        logger.error("cn2an is required for Chinese TTS number conversion")
         return False
     
-    # Extract voice path components
-    parts = voice_name.split("/")
-    if len(parts) != 3:
-        logger.error(f"Invalid voice name format: {voice_name}")
+    # Check for jieba (required for Chinese word segmentation)
+    try:
+        import jieba
+        logger.info("✓ jieba module found (required for Chinese word segmentation)")
+    except ImportError:
+        logger.error("jieba not installed. Install with: pip install jieba")
+        logger.error("jieba is required for Chinese TTS word segmentation")
         return False
     
-    lang_code_short = parts[0].split("_")[0]  # "zh"
-    voice_path = "/".join(parts[:2])  # "zh_CN/xiaoyan"
-    quality = parts[2]  # "medium"
+    # Download spaCy models
+    if not _download_spacy_models():
+        return False
     
-    # Model filename format: zh_CN-xiaoyan-medium.onnx
-    model_filename = f"{parts[0]}-{parts[1]}-{quality}.onnx"
-    config_filename = f"{parts[0]}-{parts[1]}-{quality}.onnx.json"
-    
-    # Cache directory
-    cache_dir = Path.home() / ".local" / "share" / "piper" / "voices"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Voice directory
-    voice_dir = cache_dir / voice_name
-    voice_dir.mkdir(parents=True, exist_ok=True)
-    
-    model_path = voice_dir / model_filename
-    config_path = voice_dir / config_filename
-    
-    # Check if already downloaded
-    if model_path.exists() and config_path.exists():
-        logger.info(f"Piper TTS voice already downloaded: {voice_name}")
-        return True
+    # Check for Chinese model (required for Chinese TTS)
+    try:
+        import spacy
+        try:
+            spacy.load("zh_core_web_sm")
+            logger.info("✓ Chinese spaCy model (zh_core_web_sm) found")
+        except OSError:
+            logger.info("Downloading Chinese spaCy model (zh_core_web_sm)...")
+            import subprocess
+            try:
+                subprocess.run(["python", "-m", "spacy", "download", "zh_core_web_sm"], check=True)
+                logger.info("✓ Chinese spaCy model downloaded")
+            except subprocess.CalledProcessError:
+                logger.error("Chinese spaCy model download failed (required for Chinese TTS)")
+                return False
+    except Exception as e:
+        logger.warning(f"spaCy model check failed: {e}, continuing anyway...")
     
     try:
-        logger.info(f"Downloading Piper TTS voice: {voice_name}")
+        logger.info("Initializing PyKokoro pipeline for Chinese (will download models if needed)...")
         logger.info("This may take a few minutes and requires internet connection...")
         
-        repo_id = "rhasspy/piper-voices"
-        # Path format depends on whether language has region code
-        # For Chinese (zh_CN/xiaoyan/medium): zh/zh_CN/xiaoyan/zh_CN-xiaoyan-medium.onnx
-        # For Japanese (ja/kokoro/medium): ja/kokoro/ja-kokoro-medium.onnx (no duplicate ja)
-        if "_" in parts[0]:
-            # Has region code (e.g., zh_CN) - use lang_code_short prefix
-            model_file_path = f"{lang_code_short}/{voice_path}/{model_filename}"
-            config_file_path = f"{lang_code_short}/{voice_path}/{config_filename}"
-        else:
-            # No region code (e.g., ja) - use voice_path directly
-            model_file_path = f"{voice_path}/{model_filename}"
-            config_file_path = f"{voice_path}/{config_filename}"
+        # Initialize PyKokoro pipeline with Chinese config
+        config = PipelineConfig(generation=GenerationConfig(lang='zh'))
+        pipeline = build_pipeline(config=config)
         
-        # Download to temporary location first
-        temp_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"temp_piper_{voice_name.replace('/', '_')}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
+        # Test with a simple Chinese text to trigger model download
         try:
-            logger.info("Downloading model file...")
-            downloaded_model = hf_hub_download(
-                repo_id=repo_id,
-                filename=model_file_path,
-                cache_dir=str(temp_dir),
-                local_files_only=False
-            )
-            logger.info("✓ Model file downloaded")
-            
-            logger.info("Downloading config file...")
-            downloaded_config = hf_hub_download(
-                repo_id=repo_id,
-                filename=config_file_path,
-                cache_dir=str(temp_dir),
-                local_files_only=False
-            )
-            logger.info("✓ Config file downloaded")
-            
-            # Copy to target location
-            shutil.copy2(downloaded_model, model_path)
-            shutil.copy2(downloaded_config, config_path)
-            
-            # Clean up temp directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-            logger.info("")
-            logger.info(f"✅ Piper TTS voice downloaded and cached successfully!")
-            logger.info(f"   Voice location: {voice_dir}")
-            lang_display = "Chinese" if lang_code.lower() in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"] else "Japanese"
-            logger.info(f"   {lang_display} TTS will now work offline!")
-            
-            return True
-        except Exception as download_error:
-            # Clean up temp directory on error
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise download_error
+            test_result = pipeline.run("你好", generation=GenerationConfig(lang='zh'))
+            logger.info(f"✓ Test synthesis successful (sample rate: {test_result.sample_rate} Hz)")
+        except Exception as test_error:
+            logger.warning(f"Test synthesis had issues: {test_error}")
+            logger.info("Pipeline initialized, but test failed (may need additional setup)")
+        
+        logger.info("")
+        logger.info("✅ PyKokoro Chinese model downloaded and cached successfully!")
+        logger.info("   Chinese TTS will now work offline (faster than Piper)!")
+        return True
+        
     except Exception as e:
-        error_msg = str(e).lower()
-        if any(keyword in error_msg for keyword in ["connection", "network", "timeout", "unreachable", "offline", "not found", "404"]):
-            logger.error(f"Piper TTS voice not found or cannot download (no internet).")
-            logger.error(f"Please check your internet connection and try again.")
-        else:
-            logger.error(f"Failed to download Piper TTS voice: {e}")
+        logger.error(f"Failed to initialize PyKokoro: {e}")
+        if "connection" in str(e).lower() or "network" in str(e).lower():
+            logger.error("Network error - please check your internet connection")
+        elif "spacy" in str(e).lower() or "zh_core_web_sm" in str(e).lower():
+            logger.error("spaCy model issue. Try:")
+            logger.error("  pip install spacy")
+            logger.error("  python -m spacy download en_core_web_sm  # Required")
+            logger.error("  python -m spacy download zh_core_web_sm  # Required for Chinese")
+        elif "cn2an" in str(e).lower():
+            logger.error("cn2an module missing. Install with:")
+            logger.error("  pip install cn2an  # Required for Chinese number conversion")
+        elif "jieba" in str(e).lower():
+            logger.error("jieba module missing. Install with:")
+            logger.error("  pip install jieba  # Required for Chinese word segmentation")
         return False
+
+# Piper TTS download function removed - Chinese now uses PyKokoro
 
 def download_all_models():
     """Download all available TTS models for offline use"""
@@ -253,9 +232,9 @@ def download_all_models():
         success_count += 1
     logger.info("")
     
-    # Download Chinese Piper TTS
+    # Download Chinese PyKokoro model
     logger.info("=" * 60)
-    if download_piper_tts_voice("zh"):
+    if download_pykokoro_chinese():
         success_count += 1
     logger.info("")
     
@@ -291,7 +270,7 @@ if __name__ == "__main__":
     elif args.lang.lower() in ["en", "eng", "english"]:
         success = download_mms_tts_model()
     elif args.lang.lower() in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
-        success = download_piper_tts_voice(args.lang.lower())
+        success = download_pykokoro_chinese()
     elif args.lang.lower() in ["ja", "jpn", "japanese"]:
         success = download_pykokoro_japanese()
     else:

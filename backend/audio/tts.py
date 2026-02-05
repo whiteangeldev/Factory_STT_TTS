@@ -23,13 +23,7 @@ except ImportError:
     _HAS_TORCH = False
     torch = None
 
-# Try to import Piper TTS for offline Chinese support
-try:
-    from piper import PiperVoice
-    _HAS_PIPER_TTS = True
-except ImportError:
-    _HAS_PIPER_TTS = False
-    PiperVoice = None
+# Piper TTS removed - Chinese now uses PyKokoro (faster, no g2pw overhead)
 
 # Try to import librosa for speed/tempo adjustment
 try:
@@ -50,14 +44,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Cache for loaded PiperVoice instances to avoid reloading on each request
-_piper_voice_cache = {}  # Maps voice_name -> (voice_instance, config_path, sample_rate)
-
 # Cache for loaded MMS-TTS models to avoid reloading on each request
 _mms_model_cache = {}  # Maps (model_id, device_str) -> (model, processor)
 
-# Cache for PyKokoro TTS instance
-_pykokoro_cache = None
+# Cache for PyKokoro TTS instances (separate for each language)
+_pykokoro_cache = None  # Japanese
+_pykokoro_cache_zh = None  # Chinese
 
 
 # Language to MMS-TTS model mapping (offline-capable)
@@ -112,127 +104,6 @@ def detect_language(text: str) -> str:
     
     # Default to English
     return "en"
-
-# Piper TTS voice mapping (offline-capable)
-PIPER_TTS_VOICES = {
-    # Chinese voices
-    "zh": "zh_CN/xiaoyan/medium",
-    "cmn": "zh_CN/xiaoyan/medium",
-    "zho": "zh_CN/xiaoyan/medium",
-    "chinese": "zh_CN/xiaoyan/medium",
-    "mandarin": "zh_CN/xiaoyan/medium",
-    "zh-cn": "zh_CN/xiaoyan/medium",
-}
-
-
-def _ensure_piper_voice(voice_name: str) -> tuple[Path, Path]:
-    """Ensure Piper TTS voice is available, download if needed.
-    
-    Returns:
-        Tuple of (model_path, config_path)
-    """
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        raise RuntimeError(
-            "huggingface_hub not installed. Install with: pip install huggingface_hub"
-        )
-    
-    # Extract voice path components
-    # voice_name format: "zh_CN/xiaoyan/medium" or "ja/kokoro/medium"
-    parts = voice_name.split("/")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid voice name format: {voice_name}")
-    
-    lang_code_short = parts[0].split("_")[0]  # "zh" or "ja"
-    voice_path = "/".join(parts[:2])  # "zh_CN/xiaoyan" or "ja/kokoro"
-    quality = parts[2]  # "medium"
-    
-    # Model filename format: zh_CN-xiaoyan-medium.onnx or ja-kokoro-medium.onnx
-    model_filename = f"{parts[0]}-{parts[1]}-{quality}.onnx"
-    config_filename = f"{parts[0]}-{parts[1]}-{quality}.onnx.json"
-    
-    # Cache directory
-    cache_dir = Path.home() / ".local" / "share" / "piper" / "voices"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Voice directory - use the full voice name path structure
-    voice_dir = cache_dir / voice_name
-    voice_dir.mkdir(parents=True, exist_ok=True)
-    
-    model_path = voice_dir / model_filename
-    config_path = voice_dir / config_filename
-    
-    # Check if already downloaded
-    if model_path.exists() and config_path.exists():
-        return model_path, config_path
-    
-    # Download if not cached using huggingface_hub
-    try:
-        logger.info(f"Downloading Piper TTS voice: {voice_name}")
-        repo_id = "rhasspy/piper-voices"
-        # Path format depends on whether language has region code
-        # For Chinese (zh_CN/xiaoyan/medium): zh/zh_CN/xiaoyan/zh_CN-xiaoyan-medium.onnx
-        # For Japanese (ja/kokoro/medium): ja/kokoro/ja-kokoro-medium.onnx (no duplicate ja)
-        if "_" in parts[0]:
-            # Has region code (e.g., zh_CN) - use lang_code_short prefix
-            model_file_path = f"{lang_code_short}/{voice_path}/{model_filename}"
-            config_file_path = f"{lang_code_short}/{voice_path}/{config_filename}"
-        else:
-            # No region code (e.g., ja) - use voice_path directly
-            model_file_path = f"{voice_path}/{model_filename}"
-            config_file_path = f"{voice_path}/{config_filename}"
-        
-        # Download to default HF cache first, then copy to target location
-        from huggingface_hub import snapshot_download
-        import shutil
-        
-        # Download to temporary location
-        temp_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"temp_piper_{voice_name.replace('/', '_')}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            # Download model file
-            downloaded_model = hf_hub_download(
-                repo_id=repo_id,
-                filename=model_file_path,
-                cache_dir=str(temp_dir),
-                local_files_only=False
-            )
-            
-            # Download config file
-            downloaded_config = hf_hub_download(
-                repo_id=repo_id,
-                filename=config_file_path,
-                cache_dir=str(temp_dir),
-                local_files_only=False
-            )
-            
-            # Copy to target location
-            import shutil
-            shutil.copy2(downloaded_model, model_path)
-            shutil.copy2(downloaded_config, config_path)
-            
-            # Clean up temp directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-            logger.info("✓ Voice downloaded successfully")
-            return model_path, config_path
-        except Exception as download_error:
-            # Clean up temp directory on error
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise download_error
-    except Exception as e:
-        error_msg = str(e).lower()
-        if any(keyword in error_msg for keyword in ["connection", "network", "timeout", "unreachable", "offline", "not found", "404"]):
-            raise RuntimeError(
-                f"Piper TTS voice not found in cache and cannot download (no internet or voice not found). "
-                f"Please download manually or ensure internet connection. "
-                f"Check available voices at: https://huggingface.co/rhasspy/piper-voices"
-            ) from e
-        else:
-            raise e
-
 
 def _apply_speed_adjustment(
     wav: np.ndarray,
@@ -290,6 +161,150 @@ def synthesize_speech(
         logger.info(f"Auto-detected language: {language} for text: '{text[:50]}...'")
     
     language_lower = language.lower().strip()
+    
+    # For Chinese: Use PyKokoro (faster than Piper, no g2pw overhead)
+    if language_lower in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
+        if _HAS_PYKOKORO:
+            try:
+                logger.info(f"Using PyKokoro for Chinese TTS (offline-capable, faster than Piper)")
+                
+                # Check cache first - use separate cache for Chinese
+                global _pykokoro_cache_zh
+                if '_pykokoro_cache_zh' not in globals():
+                    _pykokoro_cache_zh = None
+                
+                if _pykokoro_cache_zh is None:
+                    logger.info("Initializing PyKokoro TTS pipeline with Chinese language support...")
+                    # Configure pipeline for Chinese language
+                    try:
+                        from pykokoro import PipelineConfig, GenerationConfig
+                        config = PipelineConfig(
+                            generation=GenerationConfig(lang='zh')
+                        )
+                        _pykokoro_cache_zh = build_pipeline(config=config)
+                        logger.info("✓ PyKokoro pipeline initialized and cached (Chinese mode)")
+                    except Exception as config_error:
+                        logger.warning(f"Failed to configure Chinese language, using default: {config_error}")
+                        _pykokoro_cache_zh = build_pipeline()
+                        logger.info("✓ PyKokoro pipeline initialized and cached (default mode)")
+                else:
+                    logger.debug("Using cached PyKokoro pipeline (Chinese)")
+                
+                # Synthesize with PyKokoro
+                # Split Chinese text by punctuation to avoid PyKokoro's duplication bug
+                # PyKokoro has a known issue where it duplicates the last segment in longer sentences
+                import re
+                
+                # Split by Chinese punctuation marks (，。！？；)
+                # This prevents PyKokoro from duplicating segments
+                segments = re.split(r'([，。！？；])', text)
+                # Recombine segments with their punctuation
+                text_segments = []
+                for i in range(0, len(segments) - 1, 2):
+                    if i + 1 < len(segments):
+                        text_segments.append(segments[i] + segments[i + 1])
+                    else:
+                        text_segments.append(segments[i])
+                if len(segments) % 2 == 1 and segments[-1].strip():
+                    text_segments.append(segments[-1])
+                
+                # Filter out empty segments
+                text_segments = [s.strip() for s in text_segments if s.strip()]
+                
+                # If no segments found (no punctuation), use original text
+                if not text_segments:
+                    text_segments = [text]
+                
+                logger.debug(f"Chinese text split into {len(text_segments)} segments: {text_segments}")
+                
+                # Synthesize each segment separately and concatenate
+                from pykokoro import GenerationConfig
+                audio_segments = []
+                sample_rate = None
+                
+                for segment in text_segments:
+                    if not segment.strip():
+                        continue
+                    result = _pykokoro_cache_zh.run(segment.strip(), generation=GenerationConfig(lang='zh'))
+                    audio_segments.append(result.audio)
+                    if sample_rate is None:
+                        sample_rate = result.sample_rate
+                
+                # Concatenate all audio segments
+                if audio_segments:
+                    audio_array = np.concatenate(audio_segments)
+                    sampling_rate = sample_rate
+                else:
+                    # Fallback: synthesize entire text if segmentation failed
+                    result = _pykokoro_cache_zh.run(text, generation=GenerationConfig(lang='zh'))
+                    audio_array = result.audio
+                    sampling_rate = result.sample_rate
+                
+                # Ensure float32 format and normalize
+                wav = audio_array.astype(np.float32)
+                # If stereo, convert to mono
+                if len(wav.shape) > 1:
+                    wav = np.mean(wav, axis=1)
+                # Normalize to [-1, 1] range if needed
+                max_val = np.abs(wav).max()
+                if max_val > 1.0:
+                    wav = wav / max_val
+                elif max_val > 0:
+                    # If values are in int16 range, normalize
+                    if max_val > 32767:
+                        wav = wav / 32768.0
+                
+                # Apply speed adjustment if requested
+                if abs(speed - 1.0) > 1e-6:
+                    wav, sampling_rate = _apply_speed_adjustment(wav, sampling_rate, speed)
+                
+                # Convert to bytes (WAV format)
+                output_buffer = io.BytesIO()
+                try:
+                    sf.write(output_buffer, np.clip(wav, -1.0, 1.0), samplerate=sampling_rate, format='WAV')
+                    audio_bytes = output_buffer.getvalue()
+                    return audio_bytes, sampling_rate
+                finally:
+                    output_buffer.close()
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"PyKokoro synthesis error: {e}")
+                
+                # Provide helpful error messages for common issues
+                if "spacy" in error_msg.lower() or "zh_core_web_sm" in error_msg.lower() or "en_core_web_sm" in error_msg.lower():
+                    missing_model = "zh_core_web_sm" if "zh_core_web_sm" in error_msg.lower() else "en_core_web_sm"
+                    raise RuntimeError(
+                        f"PyKokoro requires spaCy language models for Chinese. "
+                        f"Install with:\n"
+                        f"  pip install spacy\n"
+                        f"  python -m spacy download en_core_web_sm  # Required\n"
+                        f"  python -m spacy download zh_core_web_sm  # Required for Chinese\n"
+                        f"Original error: {error_msg}"
+                    ) from e
+                elif "cn2an" in error_msg.lower() or "no module named 'cn2an'" in error_msg.lower():
+                    raise RuntimeError(
+                        f"PyKokoro requires cn2an for Chinese number conversion. "
+                        f"Install with:\n"
+                        f"  pip install cn2an\n"
+                        f"Original error: {error_msg}"
+                    ) from e
+                elif "jieba" in error_msg.lower() or "no module named 'jieba'" in error_msg.lower():
+                    raise RuntimeError(
+                        f"PyKokoro requires jieba for Chinese word segmentation. "
+                        f"Install with:\n"
+                        f"  pip install jieba\n"
+                        f"Original error: {error_msg}"
+                    ) from e
+                else:
+                    raise RuntimeError(
+                        f"PyKokoro failed for Chinese. Error: {error_msg}. "
+                        f"Install with: pip install pykokoro cn2an jieba"
+                    ) from e
+        else:
+            raise RuntimeError(
+                "Chinese TTS requires PyKokoro. "
+                "Install with: pip install pykokoro"
+            )
     
     # For Japanese: Use PyKokoro (alternative to MMS/OpenJTalk/Piper)
     if language_lower in ["ja", "jpn", "japanese"]:
@@ -508,9 +523,12 @@ def synthesize_speech(
             else:
                 raise e
     
-    # For Chinese: Try Piper TTS first (offline-capable)
+    # Chinese is now handled by PyKokoro above (faster than Piper)
+    # Piper TTS code removed - using PyKokoro instead
     piper_voice = PIPER_TTS_VOICES.get(language_lower)
     if piper_voice and _HAS_PIPER_TTS:
+        # This code path should not be reached for Chinese anymore
+        # Keeping as fallback only
         try:
             logger.info(f"Using Piper TTS for language: {language} (offline-capable)")
             
@@ -668,15 +686,14 @@ def synthesize_speech(
         supported.append("en/english (MMS-TTS - offline-capable)")
     if _HAS_PYKOKORO:
         supported.append("ja/japanese (PyKokoro - offline-capable)")
-    if _HAS_PIPER_TTS:
-        supported.append("zh/chinese (Piper TTS - offline-capable)")
+        supported.append("zh/chinese (PyKokoro - offline-capable, faster than Piper)")
     
     if not supported:
         raise RuntimeError(
             f"TTS is not available. Install dependencies:\n"
             f"  - For English (offline-capable): pip install torch transformers datasets soundfile\n"
-            f"  - For Japanese (offline-capable): pip install pykokoro\n"
-            f"  - For Chinese (offline-capable): pip install piper-tts huggingface_hub g2pw unicode-rbnf sentence-stream"
+            f"  - For Japanese/Chinese (offline-capable): pip install pykokoro spacy\n"
+            f"    Then: python -m spacy download en_core_web_sm"
         )
     
     

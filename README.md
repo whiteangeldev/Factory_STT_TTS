@@ -24,7 +24,7 @@ A comprehensive real-time speech-to-text and text-to-speech system with multi-la
 - Automatic language detection from text input
 - Multi-language TTS support (all offline-capable after initial download):
   - **English**: MMS-TTS (PyTorch-based, neural TTS)
-  - **Chinese**: Piper TTS (offline, fast, high-quality)
+  - **Chinese**: PyKokoro (offline, neural TTS, faster than Piper, no g2pw overhead)
   - **Japanese**: PyKokoro (offline, neural TTS, natural-sounding)
 - Adjustable playback speed (0.5x - 2.0x)
 - Real-time audio playback in browser
@@ -200,22 +200,29 @@ python download_tts_model.py --lang all
 
 # Or download individually:
 python download_tts_model.py --lang en  # English (MMS-TTS)
-python download_tts_model.py --lang zh  # Chinese (Piper TTS)
+python download_tts_model.py --lang zh  # Chinese (PyKokoro - faster than Piper)
 python download_tts_model.py --lang ja  # Japanese (PyKokoro)
 ```
 
 **TTS Engines:**
 - ✅ **English**: MMS-TTS (PyTorch-based, neural TTS) - Offline after download
-- ✅ **Chinese**: Piper TTS (fast, high-quality) - Offline after download
+- ✅ **Chinese**: PyKokoro (neural TTS, faster than Piper, no g2pw overhead) - Offline after download
 - ✅ **Japanese**: PyKokoro (neural TTS, natural-sounding) - Offline after download
 
-**Additional dependencies for Japanese TTS:**
+**Additional dependencies for Chinese/Japanese TTS (PyKokoro):**
 ```bash
-# PyKokoro requires spaCy language models
-pip install spacy
-python -m spacy download en_core_web_sm  # Required
+# PyKokoro requires spaCy language models and Chinese-specific dependencies
+pip install spacy cn2an jieba
+python -m spacy download en_core_web_sm  # Required for both Chinese and Japanese
+python -m spacy download zh_core_web_sm   # Required for Chinese TTS
 python -m spacy download ja_core_news_sm  # Recommended for better Japanese processing
 ```
+
+**Note**: 
+- `cn2an` is required for Chinese TTS to handle number conversion (Chinese numerals ↔ Arabic numerals)
+- `jieba` is required for Chinese TTS to perform word segmentation (breaking Chinese text into words)
+
+**Note**: Chinese TTS now uses PyKokoro instead of Piper TTS for better performance and lower latency. The old Piper TTS dependencies (g2pw, unicode-rbnf, sentence-stream) are no longer required.
 
 **Offline Operation:**
 - ✅ **All TTS engines**: Work completely offline after initial model download
