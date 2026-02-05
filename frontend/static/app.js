@@ -31,18 +31,24 @@ class STTApp {
         this.setupEventListeners();
         this.updateSystemStatus('initializing', 'Initializing...');
         this.initializeVADIndicator();
+        
+        // Initialize input mode UI - set microphone as default active
+        const micBtn = document.getElementById('micModeBtn');
+        if (micBtn && !micBtn.classList.contains('active')) {
+            micBtn.classList.add('active');
+        }
+        this.inputMode = 'microphone';
     }
     
     initializeVADIndicator() {
         // Initialize VAD indicator to "No Speech" state
         const vadDot = document.getElementById('vadDot');
-        const vadStatus = document.getElementById('vadStatus');
+        const vadStatus = document.querySelector('.vad-text');
         if (vadDot) {
             vadDot.classList.remove('active');
         }
         if (vadStatus) {
             vadStatus.textContent = 'No Speech';
-            vadStatus.style.color = '#666';
         }
     }
     
@@ -173,18 +179,14 @@ class STTApp {
     }
     
     setupEventListeners() {
+        // Recording controls
         document.getElementById('startBtn').addEventListener('click', () => this.startRecording());
         document.getElementById('stopBtn').addEventListener('click', () => this.stopRecording());
         document.getElementById('saveBtn').addEventListener('click', () => this.saveRecording());
-        document.getElementById('inputMode').addEventListener('change', (e) => {
-            const oldMode = this.inputMode;
-            this.inputMode = e.target.value;
-            if (this.isRecording) {
-                this.log('Please stop recording before changing input mode', 'warning');
-                e.target.value = oldMode;
-                this.inputMode = oldMode;
-            }
-        });
+        
+        // Input mode toggle buttons
+        document.getElementById('micModeBtn').addEventListener('click', () => this.setInputMode('microphone'));
+        document.getElementById('systemModeBtn').addEventListener('click', () => this.setInputMode('system'));
         
         // TTS event listeners
         document.getElementById('ttsPlayBtn').addEventListener('click', () => this.playTTS());
@@ -192,6 +194,53 @@ class STTApp {
         document.getElementById('ttsSpeed').addEventListener('input', (e) => {
             document.getElementById('ttsSpeedValue').textContent = `${parseFloat(e.target.value).toFixed(1)}x`;
         });
+        
+        // Logs toggle
+        const toggleLogsBtn = document.getElementById('toggleLogsBtn');
+        if (toggleLogsBtn) {
+            toggleLogsBtn.addEventListener('click', () => this.toggleLogs());
+        }
+    }
+    
+    setInputMode(mode) {
+        if (this.isRecording) {
+            this.log('Please stop recording before changing input mode', 'warning');
+            return;
+        }
+        
+        const oldMode = this.inputMode;
+        this.inputMode = mode;
+        
+        // Update button states
+        const micBtn = document.getElementById('micModeBtn');
+        const systemBtn = document.getElementById('systemModeBtn');
+        
+        if (micBtn && systemBtn) {
+            if (mode === 'microphone') {
+                micBtn.classList.add('active');
+                systemBtn.classList.remove('active');
+            } else {
+                micBtn.classList.remove('active');
+                systemBtn.classList.add('active');
+            }
+        }
+        
+        this.log(`Input mode changed to: ${mode === 'microphone' ? 'Microphone' : 'System Audio'}`, 'info');
+    }
+    
+    toggleLogs() {
+        const logContainer = document.getElementById('logArea');
+        const toggleBtn = document.getElementById('toggleLogsBtn');
+        if (logContainer && toggleBtn) {
+            const isCollapsed = logContainer.classList.contains('collapsed');
+            if (isCollapsed) {
+                logContainer.classList.remove('collapsed');
+                toggleBtn.querySelector('svg').style.transform = 'rotate(0deg)';
+            } else {
+                logContainer.classList.add('collapsed');
+                toggleBtn.querySelector('svg').style.transform = 'rotate(180deg)';
+            }
+        }
     }
     
     async startRecording() {
@@ -230,9 +279,19 @@ class STTApp {
             console.log(`AudioContext created with sample rate: ${actualSampleRate} Hz`);
             this.log(`Audio context: ${actualSampleRate} Hz`, 'info');
             
-            // Get input mode
-            const modeSelect = document.getElementById('inputMode');
-            this.inputMode = modeSelect ? modeSelect.value : 'microphone';
+            // Get input mode from active button (already set by setInputMode or default)
+            // Ensure mode is set correctly
+            const micBtn = document.getElementById('micModeBtn');
+            const systemBtn = document.getElementById('systemModeBtn');
+            if (micBtn && micBtn.classList.contains('active')) {
+                this.inputMode = 'microphone';
+            } else if (systemBtn && systemBtn.classList.contains('active')) {
+                this.inputMode = 'system';
+            } else {
+                // Default to microphone if no button is active
+                this.inputMode = 'microphone';
+                if (micBtn) micBtn.classList.add('active');
+            }
             
             let stream;
             if (this.inputMode === 'system') {
@@ -445,37 +504,41 @@ class STTApp {
             this.socket.emit('stop_recording');
         }
         
-        // Disconnect processor immediately to stop audio capture
-        if (this.processor) {
-            try {
-                this.processor.disconnect();
-            } catch (e) {
-                console.warn('Error disconnecting processor:', e);
-            }
-            this.processor = null;
-        }
-        
-        // Stop media stream tracks
-        if (this.mediaStream) {
-            this.mediaStream.getTracks().forEach(track => {
+        // For microphone mode: disconnect processor and stop media stream
+        if (this.inputMode === 'microphone') {
+            // Disconnect processor immediately to stop audio capture
+            if (this.processor) {
                 try {
-                    track.stop();
+                    this.processor.disconnect();
                 } catch (e) {
-                    console.warn('Error stopping track:', e);
+                    console.warn('Error disconnecting processor:', e);
                 }
-            });
-            this.mediaStream = null;
-        }
-        
-        // Close audio context
-        if (this.audioContext) {
-            try {
-                this.audioContext.close();
-            } catch (e) {
-                console.warn('Error closing audio context:', e);
+                this.processor = null;
             }
-            this.audioContext = null;
+            
+            // Stop media stream tracks
+            if (this.mediaStream) {
+                this.mediaStream.getTracks().forEach(track => {
+                    try {
+                        track.stop();
+                    } catch (e) {
+                        console.warn('Error stopping track:', e);
+                    }
+                });
+                this.mediaStream = null;
+            }
+            
+            // Close audio context (only for microphone mode)
+            if (this.audioContext) {
+                try {
+                    this.audioContext.close();
+                } catch (e) {
+                    console.warn('Error closing audio context:', e);
+                }
+                this.audioContext = null;
+            }
         }
+        // For system audio mode: server handles stopping, just update UI
         
         document.getElementById('startBtn').disabled = false;
         document.getElementById('stopBtn').disabled = true;
@@ -573,9 +636,10 @@ class STTApp {
         }
         const base64 = btoa(binaryString);
         
-        // Send to server (only if connected AND still recording AND not stopping)
+        // Send to server (only in microphone mode, and if connected AND still recording AND not stopping)
         // Triple-check to prevent race conditions
-        if (this.isRecording && !this.isStopping && this.socket && this.socket.connected) {
+        // System audio mode: server handles audio capture, browser doesn't send chunks
+        if (this.inputMode === 'microphone' && this.isRecording && !this.isStopping && this.socket && this.socket.connected) {
             try {
                 this.socket.emit('audio_chunk', { audio: base64 });
             } catch (error) {
@@ -735,11 +799,10 @@ class STTApp {
                 if (this.currentVadState) {
                     this.currentVadState = false;
                     const vadDot = document.getElementById('vadDot');
-                    const vadStatus = document.getElementById('vadStatus');
+                    const vadStatus = document.querySelector('.vad-text');
                     if (vadDot) vadDot.classList.remove('active');
                     if (vadStatus) {
                         vadStatus.textContent = 'No Speech';
-                        vadStatus.style.color = '#666';
                     }
                 }
                 return;  // Skip smoothing logic when speech has ended
@@ -784,7 +847,6 @@ class STTApp {
                     if (vadDot) vadDot.classList.add('active');
                     if (vadStatus) {
                         vadStatus.textContent = 'Speech Detected';
-                        vadStatus.style.color = '#4CAF50';
                     }
                 } else {
                     // No speech - hide green dot
@@ -792,10 +854,8 @@ class STTApp {
                     if (vadStatus) {
                         if (data.speech_state === 'buffering') {
                             vadStatus.textContent = 'Buffering...';
-                            vadStatus.style.color = '#FF9800';
                         } else {
                             vadStatus.textContent = 'No Speech';
-                            vadStatus.style.color = '#666';
                         }
                     }
                 }
@@ -854,11 +914,10 @@ class STTApp {
             
             // Update VAD indicator UI immediately
             const vadDot = document.getElementById('vadDot');
-            const vadStatus = document.getElementById('vadStatus');
+            const vadStatus = document.querySelector('.vad-text');
             if (vadDot) vadDot.classList.remove('active');
             if (vadStatus) {
                 vadStatus.textContent = 'No Speech';
-                vadStatus.style.color = '#666';
             }
             
             this.updateSystemStatus('listening', 'Listening...');
@@ -873,7 +932,14 @@ class STTApp {
         // Remove any interim transcription for this segment
         this.currentInterimText = '';
         const area = document.getElementById('transcriptionArea');
-        const existingInterim = area.querySelector('.transcription-item.interim');
+        
+        // Remove empty state if present
+        const emptyState = area.querySelector('.empty-state');
+        if (emptyState) {
+            emptyState.remove();
+        }
+        
+        const existingInterim = area.querySelector('.transcription-entry.interim');
         if (existingInterim) {
             existingInterim.remove();
         }
@@ -886,22 +952,26 @@ class STTApp {
         }
         this.lastTranscriptionTime = data.timestamp || Date.now() / 1000;
         
-        // Create final transcription item
+        // Create final transcription entry
         const item = document.createElement('div');
-        item.className = 'transcription-item final';
+        item.className = 'transcription-entry final';
         
         // Add confidence indicator if available
         const confidence = data.confidence || 1.0;
         const confidenceClass = confidence >= 0.9 ? 'high' : confidence >= 0.7 ? 'medium' : 'low';
         const confidenceBadge = `<span class="confidence-badge ${confidenceClass}">${(confidence * 100).toFixed(0)}%</span>`;
         
+        // Language detection badge
+        const lang = data.language || 'auto';
+        const langBadge = `<span class="lang-badge">${lang.toUpperCase()}</span>`;
+        
         item.innerHTML = `
-            <div class="transcription-header">
-                <span class="transcription-label">✓ Final</span>
+            <div class="transcription-text">${this.escapeHtml(text)}</div>
+            <div class="transcription-meta">
+                ${langBadge}
                 ${confidenceBadge}
                 ${latencyInfo}
             </div>
-            <div class="transcription-text">${this.escapeHtml(text)}</div>
         `;
         
         area.appendChild(item);
@@ -929,8 +999,14 @@ class STTApp {
         this.currentInterimText = text;
         const area = document.getElementById('transcriptionArea');
         
-        // Remove previous interim item if exists
-        const existingInterim = area.querySelector('.transcription-item.interim');
+        // Remove empty state if present
+        const emptyState = area.querySelector('.empty-state');
+        if (emptyState) {
+            emptyState.remove();
+        }
+        
+        // Remove previous interim entry if exists
+        const existingInterim = area.querySelector('.transcription-entry.interim');
         if (existingInterim) {
             existingInterim.remove();
         }
@@ -944,19 +1020,19 @@ class STTApp {
             latencyInfo = ` <span class="latency-badge first">${latency}ms</span>`;
         }
         
-        // Add new interim item with better visual feedback
+        // Add new interim entry with better visual feedback
         const item = document.createElement('div');
-        item.className = 'transcription-item interim';
+        item.className = 'transcription-entry interim';
         const confidence = data.confidence || 0.8;
         const confidenceBadge = `<span class="confidence-badge interim">${(confidence * 100).toFixed(0)}%</span>`;
         
         item.innerHTML = `
-            <div class="transcription-header">
-                <span class="transcription-label">⟳ Processing</span>
+            <div class="transcription-text">${this.escapeHtml(text)}</div>
+            <div class="transcription-meta">
+                <span class="lang-badge">PROCESSING</span>
                 ${confidenceBadge}
                 ${latencyInfo}
             </div>
-            <div class="transcription-text">${this.escapeHtml(text)}</div>
         `;
         
         area.appendChild(item);
@@ -986,12 +1062,12 @@ class STTApp {
     }
     
     updateSystemStatus(state, text) {
-        const statusBadge = document.getElementById('systemStatus');
-        if (statusBadge) {
-            statusBadge.className = `status-badge ${state}`;
-            const textSpan = statusBadge.querySelector('span:last-child');
-            if (textSpan) {
-                textSpan.textContent = text;
+        const statusIndicator = document.getElementById('systemStatus');
+        if (statusIndicator) {
+            statusIndicator.className = `status-indicator ${state}`;
+            const statusText = statusIndicator.querySelector('.status-text');
+            if (statusText) {
+                statusText.textContent = text;
             }
             console.log(`🟢 Status updated: ${state} - ${text}`);
         }
@@ -1246,5 +1322,6 @@ STTApp.prototype.updateTTSStatus = function(message, type) {
     }
     
     statusEl.textContent = message;
-    statusEl.className = `tts-status tts-status-${type}`;
+    // Update class to match new CSS structure
+    statusEl.className = type ? `tts-status ${type}` : 'tts-status';
 };
