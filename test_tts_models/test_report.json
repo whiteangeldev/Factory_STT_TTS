@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "MMS-TTS": {
+      "load_time": 6.199121952056885,
+      "avg_synthesis_time": 0.9202921390533447,
+      "avg_real_time_factor": 5.3895929232885615,
+      "sample_rate": 16000,
+      "successful_tests": 1,
+      "total_tests": 1
+    }
+  },
+  "detailed_results": {
+    "MMS-TTS": {
+      "status": "success",
+      "load_time": 6.199121952056885,
+      "sample_rate": 16000,
+      "tests": {
+        "numbers": {
+          "text": "The GDP increased by 3.7% in 1924. TTS and AI are important technologies.",
+          "synthesis_time": 0.9202921390533447,
+          "audio_duration": 4.96,
+          "real_time_factor": 5.3895929232885615,
+          "audio_file": "test_tts_models/audio_samples/MMS_TTS_numbers.wav",
+          "success": true
+        }
+      }
+    }
+  },
+  "recommendations": []
+}

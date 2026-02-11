@@ -32,7 +32,7 @@ try:
 except ImportError:
     _HAS_LIBROSA = False
 
-# Try to import PyKokoro for Japanese TTS (alternative to MMS/OpenJTalk/Piper)
+# Try to import PyKokoro for English, Japanese, and Chinese TTS (replaces MMS-TTS for English)
 try:
     from pykokoro import build_pipeline
     _HAS_PYKOKORO = True
@@ -50,9 +50,11 @@ _mms_model_cache = {}  # Maps (model_id, device_str) -> (model, processor)
 # Cache for PyKokoro TTS instances (separate for each language)
 _pykokoro_cache = None  # Japanese
 _pykokoro_cache_zh = None  # Chinese
+_pykokoro_cache_en = None  # English (82M model)
 
 
-# Language to MMS-TTS model mapping (offline-capable)
+# Language to MMS-TTS model mapping (offline-capable) - DEPRECATED: English now uses PyKokoro
+# Keeping for potential future use or fallback
 LANGUAGE_MODEL_MAP = {
     "en": "facebook/mms-tts-eng",
     "eng": "facebook/mms-tts-eng",
@@ -161,6 +163,92 @@ def synthesize_speech(
         logger.info(f"Auto-detected language: {language} for text: '{text[:50]}...'")
     
     language_lower = language.lower().strip()
+    
+    # For English: Use PyKokoro-82M (replacing MMS-TTS)
+    if language_lower in ["en", "eng", "english"]:
+        if _HAS_PYKOKORO:
+            try:
+                logger.info(f"Using PyKokoro-82M for English TTS (offline-capable)")
+                
+                # Check cache first - use separate cache for English
+                global _pykokoro_cache_en
+                if '_pykokoro_cache_en' not in globals():
+                    _pykokoro_cache_en = None
+                
+                if _pykokoro_cache_en is None:
+                    logger.info("Initializing PyKokoro TTS pipeline with English language support (82M model)...")
+                    # Configure pipeline for English language
+                    try:
+                        from pykokoro import PipelineConfig, GenerationConfig
+                        config = PipelineConfig(
+                            generation=GenerationConfig(lang='en')
+                        )
+                        _pykokoro_cache_en = build_pipeline(config=config)
+                        logger.info("✓ PyKokoro pipeline initialized and cached (English mode, 82M model)")
+                    except Exception as config_error:
+                        logger.warning(f"Failed to configure English language, using default: {config_error}")
+                        _pykokoro_cache_en = build_pipeline()
+                        logger.info("✓ PyKokoro pipeline initialized and cached (default mode)")
+                else:
+                    logger.debug("Using cached PyKokoro pipeline (English)")
+                
+                # Synthesize with PyKokoro
+                from pykokoro import GenerationConfig
+                result = _pykokoro_cache_en.run(text, generation=GenerationConfig(lang='en'))
+                
+                # Extract audio data from AudioResult
+                audio_array = result.audio
+                sampling_rate = result.sample_rate
+                
+                # Ensure float32 format and normalize
+                wav = audio_array.astype(np.float32)
+                # If stereo, convert to mono
+                if len(wav.shape) > 1:
+                    wav = np.mean(wav, axis=1)
+                # Normalize to [-1, 1] range if needed
+                max_val = np.abs(wav).max()
+                if max_val > 1.0:
+                    wav = wav / max_val
+                elif max_val > 0:
+                    # If values are in int16 range, normalize
+                    if max_val > 32767:
+                        wav = wav / 32768.0
+                
+                # Apply speed adjustment if requested
+                if abs(speed - 1.0) > 1e-6:
+                    wav, sampling_rate = _apply_speed_adjustment(wav, sampling_rate, speed)
+                
+                # Convert to bytes (WAV format)
+                output_buffer = io.BytesIO()
+                try:
+                    sf.write(output_buffer, np.clip(wav, -1.0, 1.0), samplerate=sampling_rate, format='WAV')
+                    audio_bytes = output_buffer.getvalue()
+                    return audio_bytes, sampling_rate
+                finally:
+                    output_buffer.close()
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"PyKokoro synthesis error: {e}")
+                
+                # Provide helpful error messages for common issues
+                if "spacy" in error_msg.lower() or "en_core_web_sm" in error_msg.lower():
+                    raise RuntimeError(
+                        f"PyKokoro requires spaCy language models for English. "
+                        f"Install with:\n"
+                        f"  pip install spacy\n"
+                        f"  python -m spacy download en_core_web_sm  # Required for English\n"
+                        f"Original error: {error_msg}"
+                    ) from e
+                else:
+                    raise RuntimeError(
+                        f"PyKokoro failed for English. Error: {error_msg}. "
+                        f"Install with: pip install pykokoro spacy"
+                    ) from e
+        else:
+            raise RuntimeError(
+                "English TTS requires PyKokoro. "
+                "Install with: pip install pykokoro"
+            )
     
     # For Chinese: Use PyKokoro (faster than Piper, no g2pw overhead)
     if language_lower in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
@@ -393,9 +481,11 @@ def synthesize_speech(
                 "Install with: pip install pykokoro"
             )
     
+    # MMS-TTS is deprecated for English (now using PyKokoro-82M)
+    # Keeping MMS-TTS code below as fallback for other languages if needed
     model_id = LANGUAGE_MODEL_MAP.get(language_lower)
     
-    # If MMS-TTS model exists for this language, use it
+    # If MMS-TTS model exists for this language, use it (fallback only, English should use PyKokoro above)
     if model_id is not None and _HAS_TORCH:
         try:
             logger.info(f"Using MMS-TTS model for language: {language} (offline-capable)")
@@ -682,18 +772,21 @@ def synthesize_speech(
     
     # If we get here, language is not supported or dependencies are missing
     supported = []
-    if _HAS_TORCH:
-        supported.append("en/english (MMS-TTS - offline-capable)")
     if _HAS_PYKOKORO:
+        supported.append("en/english (PyKokoro-82M - offline-capable)")
         supported.append("ja/japanese (PyKokoro - offline-capable)")
         supported.append("zh/chinese (PyKokoro - offline-capable, faster than Piper)")
+    elif _HAS_TORCH:
+        # Fallback to MMS-TTS if PyKokoro not available
+        supported.append("en/english (MMS-TTS - offline-capable, deprecated)")
     
     if not supported:
         raise RuntimeError(
             f"TTS is not available. Install dependencies:\n"
-            f"  - For English (offline-capable): pip install torch transformers datasets soundfile\n"
-            f"  - For Japanese/Chinese (offline-capable): pip install pykokoro spacy\n"
-            f"    Then: python -m spacy download en_core_web_sm"
+            f"  - For English/Japanese/Chinese (offline-capable): pip install pykokoro spacy\n"
+            f"    Then: python -m spacy download en_core_web_sm\n"
+            f"  - For Chinese: python -m spacy download zh_core_web_sm\n"
+            f"  - For Japanese: python -m spacy download ja_core_news_sm"
         )
     
     

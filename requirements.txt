@@ -18,7 +18,7 @@ audiolab
 
 # TTS dependencies (optional - install if you want to use TTS feature)
 # All TTS engines are offline-capable after initial model download
-# For English TTS (MMS-TTS - offline-capable):
+# For English TTS (PyKokoro-82M - offline-capable, replaces MMS-TTS):
 torch>=2.0.0
 transformers>=4.30.0
 datasets>=2.0.0

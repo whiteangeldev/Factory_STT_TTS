@@ -23,7 +23,7 @@ A comprehensive real-time speech-to-text and text-to-speech system with multi-la
 ### ✅ Milestone 3: Language Handling & Text-to-Speech (TTS)
 - Automatic language detection from text input
 - Multi-language TTS support (all offline-capable after initial download):
-  - **English**: MMS-TTS (PyTorch-based, neural TTS)
+  - **English**: PyKokoro-82M (neural TTS, offline-capable)
   - **Chinese**: PyKokoro (offline, neural TTS, faster than Piper, no g2pw overhead)
   - **Japanese**: PyKokoro (offline, neural TTS, natural-sounding)
 - Adjustable playback speed (0.5x - 2.0x)
@@ -53,7 +53,14 @@ pip install -r requirements.txt
 python3 run_server.py
 ```
 
-Server runs on `https://localhost:5421`.
+**Server URL:**
+- HTTPS: `https://localhost:5421` (if SSL certificates exist in `certs/` directory)
+- HTTP: `http://localhost:5421` (if no SSL certificates)
+
+**Note:** The server automatically detects and uses HTTPS if certificates are present. To generate SSL certificates, run:
+```bash
+python3 generate_certs.py
+```
 
 ## Features
 
@@ -88,7 +95,13 @@ Server runs on `https://localhost:5421`.
 ### Starting the Server
 
 1. Start the server: `python3 run_server.py`
-2. Open browser: `https://localhost:5421`
+   - Server automatically uses HTTPS if SSL certificates exist in `certs/` directory
+   - Otherwise, server runs on HTTP
+   - To force HTTPS: `python3 run_server.py --https` (requires certificates)
+   - To force HTTP: `python3 run_server.py --http`
+2. Open browser:
+   - HTTPS: `https://localhost:5421` (if certificates are configured)
+   - HTTP: `http://localhost:5421` (if no certificates)
 
 ### Speech-to-Text (STT)
 
@@ -108,15 +121,18 @@ Server runs on `https://localhost:5421`.
 
 ### Text-to-Speech (TTS)
 
-1. **Enter Text**: Type or paste text in the "Text to Speak" textarea
+1. **Enter Text**: Type or paste text in the "Enter Text" textarea
+   - Language is automatically detected from the text (English, Chinese, or Japanese)
 
 2. **Adjust Speed** (optional): Use the speed slider (0.5x - 2.0x)
+   - Default speed is 1.0x (normal speed)
 
-3. **Play**: Click **"🔊 Play"** button
+3. **Play**: Click **"Play"** button
    - Language is automatically detected from the text
    - Audio plays immediately after synthesis
+   - Status message shows detected language and playback status
 
-4. **Stop**: Click **"⏹ Stop"** to stop playback
+4. **Stop**: Click **"Stop"** to stop playback at any time
 
 ## System Audio Setup
 
@@ -131,11 +147,18 @@ Server runs on `https://localhost:5421`.
 - Set as default recording device
 
 **Linux:**
-- Configure PulseAudio loopback module
+- Configure PulseAudio loopback module:
+  ```bash
+  # Load loopback module
+  pactl load-module module-loopback
+  
+  # Or configure in /etc/pulse/default.pa
+  ```
+- Alternatively, use JACK or ALSA loopback devices
 
 ## Requirements
 
-- Python 3.8+
+- **Python 3.8 or higher** (tested with Python 3.8, 3.9, 3.10, 3.11, 3.12, 3.13)
 - Modern browser (Chrome/Edge recommended)
 - Whisper model (for STT functionality) - Downloaded automatically on first use, or pre-download with `download_whisper_model.py`
 
@@ -199,13 +222,13 @@ pip install -r requirements.txt
 python download_tts_model.py --lang all
 
 # Or download individually:
-python download_tts_model.py --lang en  # English (MMS-TTS)
+# English TTS uses PyKokoro-82M (no separate download needed, auto-downloads on first use)
 python download_tts_model.py --lang zh  # Chinese (PyKokoro - faster than Piper)
 python download_tts_model.py --lang ja  # Japanese (PyKokoro)
 ```
 
 **TTS Engines:**
-- ✅ **English**: MMS-TTS (PyTorch-based, neural TTS) - Offline after download
+- ✅ **English**: PyKokoro-82M (neural TTS, offline-capable) - Auto-downloads on first use
 - ✅ **Chinese**: PyKokoro (neural TTS, faster than Piper, no g2pw overhead) - Offline after download
 - ✅ **Japanese**: PyKokoro (neural TTS, natural-sounding) - Offline after download
 
@@ -266,7 +289,13 @@ python -m spacy download ja_core_news_sm  # Recommended for better Japanese proc
 ### TTS Issues
 - **TTS not available error**: 
   - Install TTS dependencies: `pip install -r requirements.txt`
-  - For Japanese: Install spaCy models: `pip install spacy && python -m spacy download en_core_web_sm`
+  - For Chinese/Japanese: Install spaCy models:
+    ```bash
+    pip install spacy cn2an jieba
+    python -m spacy download en_core_web_sm  # Required for both Chinese and Japanese
+    python -m spacy download zh_core_web_sm   # Required for Chinese TTS
+    python -m spacy download ja_core_news_sm  # Recommended for Japanese TTS
+    ```
   - Restart server after installing dependencies
 - **No audio playback**: 
   - Check browser console for errors
@@ -274,8 +303,8 @@ python -m spacy download ja_core_news_sm  # Recommended for better Japanese proc
   - Try a different browser (Chrome/Edge recommended)
 - **Wrong language for TTS**: 
   - Language is automatically detected from text
-  - English text uses MMS-TTS (offline)
-  - Chinese text uses Piper TTS (offline)
+  - English text uses PyKokoro-82M (offline-capable)
+  - Chinese text uses PyKokoro (offline, faster than Piper)
   - Japanese text uses PyKokoro (offline)
 - **Model download errors**:
   - Ensure internet connection for initial download
@@ -283,5 +312,18 @@ python -m spacy download ja_core_news_sm  # Recommended for better Japanese proc
   - Models are cached locally after download for offline use
 - **Japanese TTS not working**:
   - Ensure PyKokoro is installed: `pip install pykokoro`
-  - Install spaCy models: `python -m spacy download en_core_web_sm`
+  - Install required spaCy models:
+    ```bash
+    pip install spacy
+    python -m spacy download en_core_web_sm  # Required
+    python -m spacy download ja_core_news_sm  # Recommended for better Japanese processing
+    ```
+  - Check server logs for specific error messages
+- **Chinese TTS not working**:
+  - Ensure PyKokoro and Chinese dependencies are installed:
+    ```bash
+    pip install pykokoro cn2an jieba spacy
+    python -m spacy download en_core_web_sm  # Required
+    python -m spacy download zh_core_web_sm   # Required for Chinese
+    ```
   - Check server logs for specific error messages
