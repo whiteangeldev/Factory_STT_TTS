@@ -8,7 +8,7 @@ websocket-client
 scipy
 openai
 python-dotenv
-setuptools
+setuptools<81
 sounddevice
 pyaudio
 pyrnnoise
@@ -29,7 +29,8 @@ soundfile>=0.12.0
 # No longer using Piper TTS for Chinese (removed g2pw, unicode-rbnf, sentence-stream dependencies)
 
 # For Japanese/Chinese TTS (PyKokoro - offline-capable, alternative to MMS/OpenJTalk/Piper):
-pykokoro>=1.0.0
+pykokoro>=0.6.5
+pyopenjtalk  # Required by PyKokoro for Japanese G2P
 spacy>=3.7.0  # Required by PyKokoro for text processing
 cn2an>=0.5.17  # Required by PyKokoro for Chinese number conversion
 jieba>=0.42.1  # Required by PyKokoro for Chinese word segmentation

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Server entry point - auto-detects HTTPS if certificates exist"""
+import eventlet
+eventlet.monkey_patch()
+
 import sys
 import os
 import argparse

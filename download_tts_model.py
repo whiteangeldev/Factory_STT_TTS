@@ -9,41 +9,49 @@ import shutil
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Piper TTS removed - Chinese now uses PyKokoro (faster, no g2pw overhead)
+# This downloader now only supports PyKokoro-82M.
 
-def download_mms_tts_model(model_id="facebook/mms-tts-eng", language_name="English"):
-    """Download MMS-TTS model for offline use"""
+def download_pykokoro_english():
+    """Download PyKokoro-82M English model for offline use"""
     try:
-        import torch
-        from transformers import VitsModel, AutoProcessor
+        from pykokoro import build_pipeline, PipelineConfig, GenerationConfig
     except ImportError:
-        logger.error("PyTorch and transformers not installed. Install with: pip install torch transformers")
+        logger.error("PyKokoro not installed. Install with: pip install pykokoro")
         return False
-    
+
+    # Download spaCy models (English model is required)
+    if not _download_spacy_models():
+        return False
+
     try:
-        logger.info(f"Downloading MMS-TTS model: {model_id}")
+        logger.info("Initializing PyKokoro-82M pipeline for English (will download models if needed)...")
         logger.info("This may take a few minutes and requires internet connection...")
-        
-        # Download model (will be cached for offline use)
-        logger.info("Downloading model...")
-        model = VitsModel.from_pretrained(model_id)
-        logger.info("✓ Model downloaded successfully")
-        
-        logger.info("Downloading processor...")
-        processor = AutoProcessor.from_pretrained(model_id)
-        logger.info("✓ Processor downloaded successfully")
-        
+
+        # Initialize PyKokoro pipeline with English config
+        config = PipelineConfig(generation=GenerationConfig(lang='en'))
+        pipeline = build_pipeline(config=config)
+
+        # Test with a simple English text to trigger model download
+        try:
+            test_result = pipeline.run("Hello", generation=GenerationConfig(lang='en'))
+            logger.info(f"✓ Test synthesis successful (sample rate: {test_result.sample_rate} Hz)")
+        except Exception as test_error:
+            logger.warning(f"Test synthesis had issues: {test_error}")
+            logger.info("Pipeline initialized, but test failed (may need additional setup)")
+
         logger.info("")
-        logger.info(f"✅ MMS-TTS model downloaded and cached successfully!")
-        logger.info(f"   Model location: ~/.cache/huggingface/hub/models--{model_id.replace('/', '--')}")
-        logger.info(f"   {language_name} TTS will now work offline!")
-        
+        logger.info("✅ PyKokoro-82M English model downloaded and cached successfully!")
+        logger.info("   English TTS will now work offline!")
         return True
-        
+
     except Exception as e:
-        logger.error(f"Failed to download model: {e}")
+        logger.error(f"Failed to initialize PyKokoro: {e}")
         if "connection" in str(e).lower() or "network" in str(e).lower():
             logger.error("Network error - please check your internet connection")
+        elif "spacy" in str(e).lower():
+            logger.error("spaCy model issue. Try:")
+            logger.error("  pip install spacy")
+            logger.error("  python -m spacy download en_core_web_sm")
         return False
 
 def _download_spacy_models():
@@ -59,7 +67,7 @@ def _download_spacy_models():
         except OSError:
             logger.info("Downloading English spaCy model (en_core_web_sm)...")
             import subprocess
-            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
+            subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
             logger.info("✓ English spaCy model downloaded")
         
         return True
@@ -78,6 +86,14 @@ def download_pykokoro_japanese():
         logger.error("PyKokoro not installed. Install with: pip install pykokoro")
         return False
     
+    # PyKokoro Japanese requires pyopenjtalk internally for G2P
+    try:
+        import pyopenjtalk  # noqa: F401
+        logger.info("✓ pyopenjtalk module found (required for Japanese G2P)")
+    except ImportError:
+        logger.error("pyopenjtalk not installed. Install with: pip install pyopenjtalk")
+        return False
+
     # Download spaCy models
     if not _download_spacy_models():
         return False
@@ -92,7 +108,7 @@ def download_pykokoro_japanese():
             logger.info("Downloading Japanese spaCy model (ja_core_news_sm)...")
             import subprocess
             try:
-                subprocess.run(["python", "-m", "spacy", "download", "ja_core_news_sm"], check=True)
+                subprocess.run([sys.executable, "-m", "spacy", "download", "ja_core_news_sm"], check=True)
                 logger.info("✓ Japanese spaCy model downloaded")
             except subprocess.CalledProcessError:
                 logger.warning("Japanese spaCy model download failed (optional, continuing anyway)")
@@ -124,6 +140,9 @@ def download_pykokoro_japanese():
         logger.error(f"Failed to initialize PyKokoro: {e}")
         if "connection" in str(e).lower() or "network" in str(e).lower():
             logger.error("Network error - please check your internet connection")
+        elif "pyopenjtalk" in str(e).lower():
+            logger.error("pyopenjtalk missing. Install with:")
+            logger.error("  pip install pyopenjtalk")
         elif "spacy" in str(e).lower():
             logger.error("spaCy model issue. Try:")
             logger.error("  pip install spacy")
@@ -171,7 +190,7 @@ def download_pykokoro_chinese():
             logger.info("Downloading Chinese spaCy model (zh_core_web_sm)...")
             import subprocess
             try:
-                subprocess.run(["python", "-m", "spacy", "download", "zh_core_web_sm"], check=True)
+                subprocess.run([sys.executable, "-m", "spacy", "download", "zh_core_web_sm"], check=True)
                 logger.info("✓ Chinese spaCy model downloaded")
             except subprocess.CalledProcessError:
                 logger.error("Chinese spaCy model download failed (required for Chinese TTS)")
@@ -220,42 +239,38 @@ def download_pykokoro_chinese():
 # Piper TTS download function removed - Chinese now uses PyKokoro
 
 def download_all_models():
-    """Download all available TTS models for offline use"""
-    logger.info("Downloading all TTS models (English, Chinese, Japanese)...")
+    """Backward-compatible alias for downloading only PyKokoro-82M models"""
+    logger.info("Downloading PyKokoro-82M models (English, Chinese, Japanese)...")
     logger.info("")
     success_count = 0
     total = 3
-    
-    # Download English MMS-TTS
+
     logger.info("=" * 60)
-    if download_mms_tts_model():
+    if download_pykokoro_english():
         success_count += 1
     logger.info("")
-    
-    # Download Chinese PyKokoro model
+
     logger.info("=" * 60)
     if download_pykokoro_chinese():
         success_count += 1
     logger.info("")
-    
-    # Download Japanese PyKokoro model
+
     logger.info("=" * 60)
     if download_pykokoro_japanese():
         success_count += 1
     logger.info("")
-    
+
     logger.info("=" * 60)
     if success_count == total:
-        logger.info(f"✅ All {total} TTS models downloaded successfully!")
-        logger.info("English, Chinese, and Japanese TTS will now work offline!")
+        logger.info(f"✅ PyKokoro-82M prepared for all {total} languages!")
     else:
-        logger.warning(f"⚠️  {success_count}/{total} models downloaded successfully")
+        logger.warning(f"⚠️  PyKokoro-82M prepared for {success_count}/{total} languages")
         logger.warning("Some languages may not work offline")
-    
+
     return success_count == total
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download TTS models for offline use")
+    parser = argparse.ArgumentParser(description="Download PyKokoro-82M models for offline use")
     parser.add_argument("--lang", type=str, help="Language code (en, zh, ja, or 'all' for all languages)", default="all")
     
     args = parser.parse_args()
@@ -268,7 +283,7 @@ if __name__ == "__main__":
     if args.lang.lower() == "all":
         success = download_all_models()
     elif args.lang.lower() in ["en", "eng", "english"]:
-        success = download_mms_tts_model()
+        success = download_pykokoro_english()
     elif args.lang.lower() in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
         success = download_pykokoro_chinese()
     elif args.lang.lower() in ["ja", "jpn", "japanese"]:

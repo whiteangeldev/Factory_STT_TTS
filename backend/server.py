@@ -4,6 +4,7 @@ eventlet.monkey_patch()
 
 import base64
 import logging
+import re
 import numpy as np
 from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO, emit
@@ -27,13 +28,15 @@ from .audio.system_audio import SystemAudioCapture
 
 # Try to import TTS (optional - server can run without it)
 try:
-    from .audio.tts import synthesize_speech
+    from .audio.tts import synthesize_speech, split_into_sentences, detect_language
     _HAS_TTS = True
 except (ImportError, RuntimeError, PermissionError) as e:
     # Logger not yet defined, use print for early import errors
     print(f"Warning: TTS not available: {e}. TTS feature will be disabled.")
     _HAS_TTS = False
     synthesize_speech = None
+    split_into_sentences = None
+    detect_language = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -525,60 +528,105 @@ def handle_audio_chunk(data):
 
 @socketio.on('synthesize_speech')
 def handle_synthesize_speech(data):
-    """Handle TTS synthesis request"""
+    """Handle TTS synthesis request - streams sentence-by-sentence for long context."""
     client_id = request.sid
     try:
-        if not _HAS_TTS or synthesize_speech is None:
+        if not _HAS_TTS or synthesize_speech is None or split_into_sentences is None:
             emit('tts_error', {
                 'message': 'TTS is not available. Please install TTS dependencies:\n\n' +
                           'For English TTS:\n' +
                           '  pip install torch transformers datasets soundfile\n\n' +
                           'For Chinese/Japanese TTS:\n' +
-                          '  pip install gtts pydub\n\n' +
+                          '  pip install pykokoro pyopenjtalk spacy cn2an jieba\n' +
+                          '  python -m spacy download en_core_web_sm\n' +
+                          '  python -m spacy download ja_core_news_sm\n' +
+                          '  python -m spacy download zh_core_web_sm\n\n' +
                           'For speed adjustment:\n' +
                           '  pip install librosa'
             })
             return
         
         text = data.get('text', '').strip()
-        language = data.get('language', 'auto').strip()  # Default to auto-detect
+        language = data.get('language', 'auto').strip()
         speed = float(data.get('speed', 1.0))
         
         if not text:
             emit('tts_error', {'message': 'Text is required'})
             return
         
-        logger.info(f"[TTS] Synthesizing speech for {client_id[:8]}: text='{text[:50]}...', language={language} (auto-detect), speed={speed}")
+        # Split into sentences for streaming - process and play one by one
+        # Uses language-specific chunk sizes (smaller for Japanese/Chinese long-context stability)
+        sentences = split_into_sentences(text, language=language)
+        if not sentences:
+            emit('tts_error', {'message': 'No text segments to synthesize'})
+            return
         
-        # Synthesize speech (language will be auto-detected if 'auto')
-        audio_bytes, sample_rate = synthesize_speech(
-            text=text,
-            language=language,
-            speed=speed,
-            device_preference="auto"
-        )
+        detected_lang = detect_language(text) if language == 'auto' else language.lower()
+        total = len(sentences)
         
-        # Convert to base64 for transmission
-        import base64
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+        logger.info(f"[TTS] Streaming {total} segments for {client_id[:8]}: lang={detected_lang}, speed={speed}")
         
-        # Detect the actual language used (in case it was auto-detected)
-        from .audio.tts import detect_language
-        detected_lang = detect_language(text) if language == 'auto' else language
+        emit('tts_stream_start', {'total': total, 'language': detected_lang}, room=client_id)
+        eventlet.sleep(0)  # Yield so eventlet can flush socket; otherwise chunks never reach client
         
-        logger.info(f"[TTS] Synthesized {len(audio_bytes)} bytes of audio (sample_rate={sample_rate}Hz, language={detected_lang})")
+        for idx, segment in enumerate(sentences):
+            # Strip any citation markers per segment (safety)
+            seg_clean = re.sub(r'\[\d+\]', '', segment).strip()
+            if not seg_clean:
+                continue
+            try:
+                audio_bytes, sample_rate = synthesize_speech(
+                    text=seg_clean,
+                    language=detected_lang,
+                    speed=speed,
+                    device_preference="auto"
+                )
+            except Exception as seg_err:
+                # Retry by splitting into smaller sub-segments (e.g. long sentence or problematic phrasing)
+                logger.warning(f"[TTS] Segment {idx + 1}/{total} failed, retrying in smaller chunks: {seg_err!r}")
+                sub_sentences = split_into_sentences(seg_clean, language=detected_lang, max_chars=50)
+                for sub in sub_sentences:
+                    if not sub.strip():
+                        continue
+                    try:
+                        audio_bytes, sample_rate = synthesize_speech(
+                            text=sub,
+                            language=detected_lang,
+                            speed=speed,
+                            device_preference="auto"
+                        )
+                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                        emit('tts_audio_chunk', {
+                            'audio': audio_b64,
+                            'sample_rate': sample_rate,
+                            'index': idx,
+                            'total': total,
+                            'text': sub,
+                            'language': detected_lang
+                        }, room=client_id)
+                        eventlet.sleep(0)
+                    except Exception as sub_err:
+                        logger.warning(f"[TTS] Sub-segment failed, skipping: {sub_err!r}. Text: {sub[:50]}...")
+                continue
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            emit('tts_audio_chunk', {
+                'audio': audio_b64,
+                'sample_rate': sample_rate,
+                'index': idx,
+                'total': total,
+                'text': seg_clean,
+                'language': detected_lang
+            }, room=client_id)
+            eventlet.sleep(0)  # Yield after each chunk so it is sent immediately (critical for long context)
         
-        # Emit audio data to client
-        emit('tts_audio', {
-            'audio': audio_b64,
-            'sample_rate': sample_rate,
-            'text': text,
-            'language': detected_lang
-        })
+        emit('tts_stream_complete', {'total': total, 'language': detected_lang}, room=client_id)
+        eventlet.sleep(0)
+        logger.info(f"[TTS] Streamed {total} chunks to {client_id[:8]}")
         
     except Exception as e:
         logger.error(f"Error in synthesize_speech: {e}", exc_info=True)
-        emit('tts_error', {'message': str(e)})
+        emit('tts_error', {'message': str(e)}, room=client_id)
+        emit('tts_stream_complete', {'total': 0, 'error': str(e)}, room=client_id)
 
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')

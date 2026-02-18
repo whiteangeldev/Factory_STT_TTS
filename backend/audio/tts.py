@@ -2,8 +2,10 @@
 import io
 import json
 import logging
+import re
 import time
 from pathlib import Path
+from typing import Optional
 
 # Try to import required dependencies (make them optional)
 try:
@@ -132,6 +134,136 @@ def _apply_speed_adjustment(
     return adjusted.astype(np.float32), sr
 
 
+def _split_text_segments(text: str, lang: str, max_chars: int = 140) -> list[str]:
+    """Split text into safer TTS chunks for long-form synthesis."""
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not cleaned:
+        return []
+
+    # Split only at sentence-ending punctuation (one segment = one sentence)
+    if lang == "zh":
+        boundary_regex = r'([。！？；])'
+    elif lang == "ja":
+        boundary_regex = r'([。！？])'
+    else:
+        boundary_regex = r'([.!?])'
+
+    paragraphs = [p.strip() for p in cleaned.split("\n") if p.strip()]
+    if not paragraphs:
+        paragraphs = [cleaned]
+
+    chunks: list[str] = []
+
+    def _append_or_split(piece: str):
+        piece = piece.strip()
+        if not piece:
+            return
+        if len(piece) <= max_chars:
+            chunks.append(piece)
+            return
+        # Hard split when no punctuation boundary is available.
+        start = 0
+        while start < len(piece):
+            end = min(start + max_chars, len(piece))
+            sub = piece[start:end].strip()
+            if sub:
+                chunks.append(sub)
+            start = end
+
+    for para in paragraphs:
+        parts = re.split(boundary_regex, para)
+        sentences = []
+        for i in range(0, len(parts), 2):
+            base = parts[i].strip() if i < len(parts) else ""
+            punct = parts[i + 1] if i + 1 < len(parts) else ""
+            merged = f"{base}{punct}".strip()
+            if merged:
+                sentences.append(merged)
+
+        if not sentences:
+            sentences = [para]
+
+        # One segment = one sentence (no merging)
+        for sentence in sentences:
+            _append_or_split(sentence)
+
+    return chunks
+
+
+def split_into_sentences(text: str, language: str = "auto", max_chars: Optional[int] = None) -> list[str]:
+    """Split text into sentences/chunks for streaming TTS.
+    Returns list of strings suitable for one-by-one synthesis and playback.
+    Uses language-specific max_chars: Japanese/Chinese need smaller chunks for stability.
+    Strips citation markers (e.g. [27], [28]) that cause odd TTS output.
+    """
+    if not text or not text.strip():
+        return []
+    # Strip Wikipedia/academic citation markers like [27], [28] before TTS
+    cleaned = re.sub(r'\[\d+\]', '', text.strip()).strip()
+    if not cleaned:
+        return []
+    lang = detect_language(cleaned) if language.lower() in ("auto", "") else language.lower().strip()
+    if max_chars is None:
+        # Japanese and Chinese need smaller chunks for long-context stability
+        max_chars = 60 if lang in ("ja", "zh") else 100
+    return _split_text_segments(cleaned, lang=lang, max_chars=max_chars)
+
+
+def _run_pykokoro_chunked(pipeline, text: str, lang: str, max_chars: int = 140) -> tuple[np.ndarray, int]:
+    """Run PyKokoro in chunks and stitch audio for better long-text stability."""
+    from pykokoro import GenerationConfig
+
+    segments = _split_text_segments(text, lang=lang, max_chars=max_chars)
+    if not segments:
+        raise RuntimeError("No text segments available for TTS.")
+
+    logger.debug(f"PyKokoro chunked synthesis: lang={lang}, segments={len(segments)}")
+
+    audio_segments = []
+    sampling_rate = None
+    pause = None
+
+    for segment in segments:
+        try:
+            result = pipeline.run(segment, generation=GenerationConfig(lang=lang))
+            seg_audio = result.audio
+            seg_rate = result.sample_rate
+        except Exception:
+            # Retry a failing segment with smaller pieces.
+            smaller = _split_text_segments(segment, lang=lang, max_chars=max(60, max_chars // 2))
+            if len(smaller) <= 1:
+                raise
+            for sub in smaller:
+                sub_result = pipeline.run(sub, generation=GenerationConfig(lang=lang))
+                seg_audio = sub_result.audio
+                seg_rate = sub_result.sample_rate
+                if sampling_rate is None:
+                    sampling_rate = seg_rate
+                    pause = np.zeros(max(1, int(sampling_rate * 0.03)), dtype=np.float32)
+                elif seg_rate != sampling_rate:
+                    raise RuntimeError(f"Inconsistent sample rate across chunks: {sampling_rate} vs {seg_rate}")
+                audio_segments.append(seg_audio)
+                audio_segments.append(pause)
+            continue
+
+        if sampling_rate is None:
+            sampling_rate = seg_rate
+            pause = np.zeros(max(1, int(sampling_rate * 0.03)), dtype=np.float32)
+        elif seg_rate != sampling_rate:
+            raise RuntimeError(f"Inconsistent sample rate across chunks: {sampling_rate} vs {seg_rate}")
+
+        audio_segments.append(seg_audio)
+        audio_segments.append(pause)
+
+    if not audio_segments:
+        raise RuntimeError("TTS did not produce audio output.")
+
+    if len(audio_segments) > 1:
+        audio_segments = audio_segments[:-1]  # drop trailing pause
+
+    return np.concatenate(audio_segments), sampling_rate
+
+
 def synthesize_speech(
     text: str,
     language: str = "auto",
@@ -192,13 +324,10 @@ def synthesize_speech(
                 else:
                     logger.debug("Using cached PyKokoro pipeline (English)")
                 
-                # Synthesize with PyKokoro
-                from pykokoro import GenerationConfig
-                result = _pykokoro_cache_en.run(text, generation=GenerationConfig(lang='en'))
-                
-                # Extract audio data from AudioResult
-                audio_array = result.audio
-                sampling_rate = result.sample_rate
+                # Synthesize with PyKokoro (chunked for long-text stability)
+                audio_array, sampling_rate = _run_pykokoro_chunked(
+                    _pykokoro_cache_en, text, lang='en', max_chars=180
+                )
                 
                 # Ensure float32 format and normalize
                 wav = audio_array.astype(np.float32)
@@ -278,55 +407,10 @@ def synthesize_speech(
                 else:
                     logger.debug("Using cached PyKokoro pipeline (Chinese)")
                 
-                # Synthesize with PyKokoro
-                # Split Chinese text by punctuation to avoid PyKokoro's duplication bug
-                # PyKokoro has a known issue where it duplicates the last segment in longer sentences
-                import re
-                
-                # Split by Chinese punctuation marks (，。！？；)
-                # This prevents PyKokoro from duplicating segments
-                segments = re.split(r'([，。！？；])', text)
-                # Recombine segments with their punctuation
-                text_segments = []
-                for i in range(0, len(segments) - 1, 2):
-                    if i + 1 < len(segments):
-                        text_segments.append(segments[i] + segments[i + 1])
-                    else:
-                        text_segments.append(segments[i])
-                if len(segments) % 2 == 1 and segments[-1].strip():
-                    text_segments.append(segments[-1])
-                
-                # Filter out empty segments
-                text_segments = [s.strip() for s in text_segments if s.strip()]
-                
-                # If no segments found (no punctuation), use original text
-                if not text_segments:
-                    text_segments = [text]
-                
-                logger.debug(f"Chinese text split into {len(text_segments)} segments: {text_segments}")
-                
-                # Synthesize each segment separately and concatenate
-                from pykokoro import GenerationConfig
-                audio_segments = []
-                sample_rate = None
-                
-                for segment in text_segments:
-                    if not segment.strip():
-                        continue
-                    result = _pykokoro_cache_zh.run(segment.strip(), generation=GenerationConfig(lang='zh'))
-                    audio_segments.append(result.audio)
-                    if sample_rate is None:
-                        sample_rate = result.sample_rate
-                
-                # Concatenate all audio segments
-                if audio_segments:
-                    audio_array = np.concatenate(audio_segments)
-                    sampling_rate = sample_rate
-                else:
-                    # Fallback: synthesize entire text if segmentation failed
-                    result = _pykokoro_cache_zh.run(text, generation=GenerationConfig(lang='zh'))
-                    audio_array = result.audio
-                    sampling_rate = result.sample_rate
+                # Synthesize with PyKokoro (chunked for long-text stability)
+                audio_array, sampling_rate = _run_pykokoro_chunked(
+                    _pykokoro_cache_zh, text, lang='zh', max_chars=120
+                )
                 
                 # Ensure float32 format and normalize
                 wav = audio_array.astype(np.float32)
@@ -419,16 +503,10 @@ def synthesize_speech(
                 else:
                     logger.debug("Using cached PyKokoro pipeline")
                 
-                # Synthesize with PyKokoro
-                # pipeline.run() returns AudioResult with audio data
-                # Use generation parameter with lang='ja' to ensure Japanese synthesis
-                from pykokoro import GenerationConfig
-                result = _pykokoro_cache.run(text, generation=GenerationConfig(lang='ja'))
-                
-                # Extract audio data from AudioResult
-                # AudioResult has .audio (numpy array) and .sample_rate
-                audio_array = result.audio
-                sampling_rate = result.sample_rate
+                # Synthesize with PyKokoro (chunked for long-text stability)
+                audio_array, sampling_rate = _run_pykokoro_chunked(
+                    _pykokoro_cache, text, lang='ja', max_chars=120
+                )
                 
                 # Ensure float32 format and normalize
                 wav = audio_array.astype(np.float32)
@@ -461,7 +539,14 @@ def synthesize_speech(
                 logger.error(f"PyKokoro synthesis error: {e}")
                 
                 # Provide helpful error messages for common issues
-                if "spacy" in error_msg.lower() or "en_core_web_sm" in error_msg.lower():
+                if "pyopenjtalk" in error_msg.lower() or "no module named 'pyopenjtalk'" in error_msg.lower():
+                    raise RuntimeError(
+                        f"Japanese TTS uses PyKokoro, but PyKokoro requires pyopenjtalk for Japanese G2P. "
+                        f"Install with:\n"
+                        f"  pip install pyopenjtalk\n"
+                        f"Original error: {error_msg}"
+                    ) from e
+                elif "spacy" in error_msg.lower() or "en_core_web_sm" in error_msg.lower() or "ja_core_news_sm" in error_msg.lower():
                     raise RuntimeError(
                         f"PyKokoro requires spaCy language models. "
                         f"Install with:\n"
@@ -473,7 +558,7 @@ def synthesize_speech(
                 else:
                     raise RuntimeError(
                         f"PyKokoro failed for Japanese. Error: {error_msg}. "
-                        f"Install with: pip install pykokoro"
+                        f"Install with: pip install pykokoro pyopenjtalk spacy"
                     ) from e
         else:
             raise RuntimeError(
