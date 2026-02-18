@@ -28,14 +28,13 @@ from .audio.system_audio import SystemAudioCapture
 
 # Try to import TTS (optional - server can run without it)
 try:
-    from .audio.tts import synthesize_speech, split_into_sentences, detect_language
+    from .audio.tts import synthesize_speech, detect_language
     _HAS_TTS = True
 except (ImportError, RuntimeError, PermissionError) as e:
     # Logger not yet defined, use print for early import errors
     print(f"Warning: TTS not available: {e}. TTS feature will be disabled.")
     _HAS_TTS = False
     synthesize_speech = None
-    split_into_sentences = None
     detect_language = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -178,6 +177,173 @@ client_system_audio = {}  # Server-side system audio capture per client
 client_audio_queues = {}  # Queues for passing audio from background threads to eventlet
 MIN_CHUNK_SIZE = 480
 MIN_AUDIO_LEVEL = 0.0005
+MAX_TTS_SEGMENT_CHARS = 220
+
+
+def _sanitize_tts_text_for_segmentation(text: str) -> str:
+    """Remove reference markers and normalize spacing before sentence splitting."""
+    if not text:
+        return ""
+    cleaned = str(text)
+    # Remove citation markers that should not be spoken.
+    cleaned = re.sub(r'\[\d+(?:\s*,\s*\d+)*\]', '', cleaned)
+    cleaned = re.sub(r'【\d+(?:\s*,\s*\d+)*】', '', cleaned)
+    # Remove empty bracket groups such as [] that may remain after cleanup.
+    cleaned = re.sub(r'\[\s*\]', '', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _has_speakable_content(text: str) -> bool:
+    """Return True when the segment contains letters/numbers/CJK content."""
+    if not text:
+        return False
+    return re.search(r'[A-Za-z0-9\u4e00-\u9fff\u3040-\u30ff]', text) is not None
+
+
+def _split_long_sentence(sentence: str, max_chars: int = MAX_TTS_SEGMENT_CHARS) -> list[str]:
+    """Split a long sentence into smaller chunks while preserving punctuation where possible."""
+    text = sentence.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    # Prefer splitting on comma-like separators first.
+    parts = re.split(r'([,，、:：]+)', text)
+    chunks = []
+    current = ""
+    for i in range(0, len(parts), 2):
+        content = parts[i].strip()
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        piece = f"{content}{sep}".strip()
+        if not piece:
+            continue
+        if not current:
+            current = piece
+        elif len(current) + 1 + len(piece) <= max_chars:
+            current = f"{current} {piece}".strip()
+        else:
+            chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+
+    # If still too long, split by words (for spaced languages) or hard-cut as final fallback.
+    final_chunks = []
+    for chunk in chunks if chunks else [text]:
+        if len(chunk) <= max_chars:
+            final_chunks.append(chunk)
+            continue
+
+        words = chunk.split()
+        if len(words) > 1:
+            current_words = []
+            current_len = 0
+            for word in words:
+                next_len = len(word) if current_len == 0 else current_len + 1 + len(word)
+                if next_len <= max_chars:
+                    current_words.append(word)
+                    current_len = next_len
+                else:
+                    final_chunks.append(" ".join(current_words))
+                    current_words = [word]
+                    current_len = len(word)
+            if current_words:
+                final_chunks.append(" ".join(current_words))
+        else:
+            for idx in range(0, len(chunk), max_chars):
+                final_chunks.append(chunk[idx:idx + max_chars].strip())
+
+    return [c for c in final_chunks if c]
+
+
+def split_text_for_tts(text: str, max_chars: int = MAX_TTS_SEGMENT_CHARS) -> list[str]:
+    """
+    Split text into sentence-sized chunks for safer TTS processing.
+    Supports English/Chinese/Japanese punctuation.
+    """
+    normalized = _sanitize_tts_text_for_segmentation(text)
+    if not normalized:
+        return []
+
+    raw_segments = []
+    start = 0
+    # Sentence endings for mixed-language text.
+    for match in re.finditer(r'[.!?。！？]+(?:["\'”’)\]]+)?', normalized):
+        end = match.end()
+        segment = normalized[start:end].strip()
+        if segment:
+            raw_segments.append(segment)
+        start = end
+
+    tail = normalized[start:].strip()
+    if tail:
+        raw_segments.append(tail)
+
+    if not raw_segments:
+        raw_segments = [normalized]
+
+    final_segments = []
+    for segment in raw_segments:
+        final_segments.extend(_split_long_sentence(segment, max_chars=max_chars))
+    return [s for s in final_segments if _has_speakable_content(s)]
+
+
+def _stream_tts_segments(
+    client_id: str,
+    request_id,
+    detected_lang: str,
+    speed: float,
+    text_segments: list[str]
+):
+    """Synthesize and emit TTS audio one segment at a time for low-latency playback."""
+    safe_segments = [seg for seg in text_segments if _has_speakable_content(seg)]
+    total_segments = len(safe_segments)
+    total_bytes = 0
+
+    if total_segments == 0:
+        error_payload = {'message': 'No valid text segments to synthesize'}
+        if request_id:
+            error_payload['request_id'] = request_id
+        socketio.emit('tts_error', error_payload, room=client_id)
+        return
+
+    try:
+        for idx, segment_text in enumerate(safe_segments):
+            audio_bytes, sample_rate = synthesize_speech(
+                text=segment_text,
+                language=detected_lang,
+                speed=speed,
+                device_preference="auto"
+            )
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            total_bytes += len(audio_bytes)
+
+            socketio.emit('tts_audio', {
+                'request_id': request_id,
+                'audio': audio_b64,
+                'sample_rate': sample_rate,
+                'text': segment_text,
+                'language': detected_lang,
+                'segment_index': idx,
+                'segment_count': total_segments,
+                'is_last': idx == total_segments - 1
+            }, room=client_id)
+
+            logger.info(f"[TTS] Emitted segment {idx + 1}/{total_segments} to {client_id[:8]}")
+            # Yield to eventlet so packets are flushed immediately between segments.
+            socketio.sleep(0)
+
+        logger.info(
+            f"[TTS] Synthesized {total_segments} segment(s), total_audio_bytes={total_bytes}, language={detected_lang}"
+        )
+    except Exception as e:
+        logger.error(f"Error streaming tts segments: {e}", exc_info=True)
+        error_payload = {'message': str(e)}
+        if request_id:
+            error_payload['request_id'] = request_id
+        socketio.emit('tts_error', error_payload, room=client_id)
 
 def speech_event_callback(event_type: str, data: dict):
     try:
@@ -530,8 +696,9 @@ def handle_audio_chunk(data):
 def handle_synthesize_speech(data):
     """Handle TTS synthesis request - streams sentence-by-sentence for long context."""
     client_id = request.sid
+    request_id = None
     try:
-        if not _HAS_TTS or synthesize_speech is None or split_into_sentences is None:
+        if not _HAS_TTS or synthesize_speech is None or detect_language is None:
             emit('tts_error', {
                 'message': 'TTS is not available. Please install TTS dependencies:\n\n' +
                           'For English TTS:\n' +
@@ -549,84 +716,39 @@ def handle_synthesize_speech(data):
         text = data.get('text', '').strip()
         language = data.get('language', 'auto').strip()
         speed = float(data.get('speed', 1.0))
+        request_id = data.get('request_id') if isinstance(data, dict) else None
         
         if not text:
             emit('tts_error', {'message': 'Text is required'})
             return
         
-        # Split into sentences for streaming - process and play one by one
-        # Uses language-specific chunk sizes (smaller for Japanese/Chinese long-context stability)
-        sentences = split_into_sentences(text, language=language)
-        if not sentences:
-            emit('tts_error', {'message': 'No text segments to synthesize'})
+        logger.info(f"[TTS] Synthesizing speech for {client_id[:8]}: text='{text[:50]}...', language={language} (auto-detect), speed={speed}")
+
+        detected_lang = detect_language(text) if language == 'auto' else language
+
+        # Split long text into sentence-level segments and synthesize in order.
+        text_segments = split_text_for_tts(text)
+        if not text_segments:
+            emit('tts_error', {'message': 'No valid text segments to synthesize'})
             return
-        
-        detected_lang = detect_language(text) if language == 'auto' else language.lower()
-        total = len(sentences)
-        
-        logger.info(f"[TTS] Streaming {total} segments for {client_id[:8]}: lang={detected_lang}, speed={speed}")
-        
-        emit('tts_stream_start', {'total': total, 'language': detected_lang}, room=client_id)
-        eventlet.sleep(0)  # Yield so eventlet can flush socket; otherwise chunks never reach client
-        
-        for idx, segment in enumerate(sentences):
-            # Strip any citation markers per segment (safety)
-            seg_clean = re.sub(r'\[\d+\]', '', segment).strip()
-            if not seg_clean:
-                continue
-            try:
-                audio_bytes, sample_rate = synthesize_speech(
-                    text=seg_clean,
-                    language=detected_lang,
-                    speed=speed,
-                    device_preference="auto"
-                )
-            except Exception as seg_err:
-                # Retry by splitting into smaller sub-segments (e.g. long sentence or problematic phrasing)
-                logger.warning(f"[TTS] Segment {idx + 1}/{total} failed, retrying in smaller chunks: {seg_err!r}")
-                sub_sentences = split_into_sentences(seg_clean, language=detected_lang, max_chars=50)
-                for sub in sub_sentences:
-                    if not sub.strip():
-                        continue
-                    try:
-                        audio_bytes, sample_rate = synthesize_speech(
-                            text=sub,
-                            language=detected_lang,
-                            speed=speed,
-                            device_preference="auto"
-                        )
-                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                        emit('tts_audio_chunk', {
-                            'audio': audio_b64,
-                            'sample_rate': sample_rate,
-                            'index': idx,
-                            'total': total,
-                            'text': sub,
-                            'language': detected_lang
-                        }, room=client_id)
-                        eventlet.sleep(0)
-                    except Exception as sub_err:
-                        logger.warning(f"[TTS] Sub-segment failed, skipping: {sub_err!r}. Text: {sub[:50]}...")
-                continue
-            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-            emit('tts_audio_chunk', {
-                'audio': audio_b64,
-                'sample_rate': sample_rate,
-                'index': idx,
-                'total': total,
-                'text': seg_clean,
-                'language': detected_lang
-            }, room=client_id)
-            eventlet.sleep(0)  # Yield after each chunk so it is sent immediately (critical for long context)
-        
-        emit('tts_stream_complete', {'total': total, 'language': detected_lang}, room=client_id)
-        eventlet.sleep(0)
-        logger.info(f"[TTS] Streamed {total} chunks to {client_id[:8]}")
+
+        logger.info(f"[TTS] Split input into {len(text_segments)} segment(s) for sequential synthesis")
+
+        socketio.start_background_task(
+            _stream_tts_segments,
+            client_id,
+            request_id,
+            detected_lang,
+            speed,
+            text_segments
+        )
         
     except Exception as e:
         logger.error(f"Error in synthesize_speech: {e}", exc_info=True)
-        emit('tts_error', {'message': str(e)}, room=client_id)
-        emit('tts_stream_complete', {'total': 0, 'error': str(e)}, room=client_id)
+        error_payload = {'message': str(e)}
+        if request_id:
+            error_payload['request_id'] = request_id
+        emit('tts_error', error_payload)
 
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')

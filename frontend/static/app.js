@@ -22,10 +22,12 @@ class STTApp {
         // TTS state (streaming: queue chunks, play one by one)
         this.ttsAudio = null;
         this.isTTSPlaying = false;
-        this.ttsChunkQueue = [];
-        this.ttsStreamTotal = 0;
+        this.ttsQueue = [];
+        this.ttsCurrentIndex = 0; // Number of segments already started
+        this.ttsObjectUrls = [];
+        this.ttsActiveRequestId = null;
+        this.ttsExpectedSegments = 0;
         this.ttsStreamComplete = false;
-        this.ttsStreamAborted = false;
         
         this.init();
     }
@@ -80,15 +82,9 @@ class STTApp {
             this.log(data.message || 'Socket.IO ready - VAD and noise reduction active', 'success');
         });
         
-        // TTS event handlers (streaming: sentence-by-sentence)
-        this.socket.on('tts_stream_start', (data) => {
-            this.handleTTSStreamStart(data);
-        });
-        this.socket.on('tts_audio_chunk', (data) => {
-            this.handleTTSAudioChunk(data);
-        });
-        this.socket.on('tts_stream_complete', (data) => {
-            this.handleTTSStreamComplete(data);
+        // TTS event handlers (streaming segment-by-segment via tts_audio)
+        this.socket.on('tts_audio', (data) => {
+            this.handleTTSAudio(data);
         });
         this.socket.on('tts_error', (data) => {
             this.handleTTSError(data);
@@ -1237,119 +1233,173 @@ STTApp.prototype.playTTS = function() {
     
     // Stop any currently playing audio
     this.stopTTS();
+    this.ttsActiveRequestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    this.ttsExpectedSegments = 0;
+    this.ttsStreamComplete = false;
+    this.ttsCurrentIndex = 0;
     
     // Update UI
     document.getElementById('ttsPlayBtn').disabled = true;
     document.getElementById('ttsStopBtn').disabled = false;
-    this.updateTTSStatus('Detecting language and synthesizing speech...', 'info');
+    this.updateTTSStatus('Detecting language and synthesizing first sentence...', 'info');
     
-    // Request TTS synthesis (server streams sentence-by-sentence for long context)
+    // Request TTS synthesis (language will be auto-detected on server).
+    // Server streams each sentence as soon as it is synthesized.
     this.socket.emit('synthesize_speech', {
         text: text,
-        speed: speed
+        speed: speed,
+        request_id: this.ttsActiveRequestId
     });
 };
 
-STTApp.prototype.stopTTS = function() {
+STTApp.prototype.stopTTS = function(options = {}) {
+    const clearStatus = options.clearStatus !== false;
+
     if (this.ttsAudio) {
         this.ttsAudio.pause();
         this.ttsAudio.currentTime = 0;
         this.ttsAudio = null;
     }
-    this.isTTSPlaying = false;
-    this.ttsChunkQueue = [];
+    this.ttsQueue = [];
+    this.ttsCurrentIndex = 0;
+    this.ttsObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+    this.ttsObjectUrls = [];
+    this.ttsActiveRequestId = null;
+    this.ttsExpectedSegments = 0;
     this.ttsStreamComplete = false;
-    this.ttsStreamAborted = true;
+    this.isTTSPlaying = false;
     document.getElementById('ttsPlayBtn').disabled = false;
     document.getElementById('ttsStopBtn').disabled = true;
-    this.updateTTSStatus('', '');
-};
-
-STTApp.prototype.handleTTSStreamStart = function(data) {
-    this.ttsChunkQueue = [];
-    this.ttsStreamTotal = data.total || 0;
-    this.ttsStreamComplete = false;
-    this.ttsStreamAborted = false;
-    const langName = data.language === 'en' ? 'English' : data.language === 'zh' ? 'Chinese' : data.language === 'ja' ? 'Japanese' : data.language;
-    this.updateTTSStatus(`Streaming ${this.ttsStreamTotal} segment(s) (${langName})...`, 'info');
-};
-
-STTApp.prototype.handleTTSAudioChunk = function(data) {
-    try {
-        if (this.ttsStreamAborted) return; // User stopped, ignore incoming chunks
-        this.ttsChunkQueue = this.ttsChunkQueue || [];
-        this.ttsChunkQueue.push(data);
-        this._playNextTTSChunk();
-    } catch (error) {
-        console.error('Error queuing TTS chunk:', error);
+    if (clearStatus) {
+        this.updateTTSStatus('', '');
     }
 };
 
-STTApp.prototype.handleTTSStreamComplete = function(data) {
-    this.ttsStreamComplete = true;
-    if (data.error) {
-        this.updateTTSStatus(data.error, 'error');
+STTApp.prototype.createTTSAudioUrl = function(base64Audio) {
+    const audioData = atob(base64Audio);
+    const audioArray = new Uint8Array(audioData.length);
+    for (let i = 0; i < audioData.length; i++) {
+        audioArray[i] = audioData.charCodeAt(i);
     }
-    this._playNextTTSChunk(); // In case queue was empty, trigger completion check
+    const blob = new Blob([audioArray], { type: 'audio/wav' });
+    const audioUrl = URL.createObjectURL(blob);
+    this.ttsObjectUrls.push(audioUrl);
+    return audioUrl;
 };
 
-STTApp.prototype._playNextTTSChunk = function() {
-    if (!this.ttsChunkQueue || this.ttsChunkQueue.length === 0) {
-        if (this.ttsStreamComplete && !this.ttsStreamAborted) {
-            this.isTTSPlaying = false;
-            document.getElementById('ttsPlayBtn').disabled = false;
-            document.getElementById('ttsStopBtn').disabled = true;
+STTApp.prototype.playNextTTSSegment = function() {
+    if (!this.isTTSPlaying) return;
+
+    if (this.ttsQueue.length === 0) {
+        if (this.ttsStreamComplete) {
+            this.stopTTS({ clearStatus: false });
             this.updateTTSStatus('Playback completed', 'success');
+        } else {
+            const played = this.ttsCurrentIndex;
+            const totalText = this.ttsExpectedSegments > 0 ? this.ttsExpectedSegments : '?';
+            this.updateTTSStatus(`Synthesizing next sentence... (${played}/${totalText})`, 'info');
         }
         return;
     }
-    if (this.isTTSPlaying) return; // Wait for current chunk to finish
-    const data = this.ttsChunkQueue.shift();
+
+    const segment = this.ttsQueue.shift();
+    const currentSegment = this.ttsCurrentIndex + 1;
+    const totalSegments = this.ttsExpectedSegments > 0 ? this.ttsExpectedSegments : currentSegment;
+    this.ttsCurrentIndex += 1;
+
+    if (this.ttsAudio) {
+        this.ttsAudio.pause();
+        this.ttsAudio.currentTime = 0;
+        this.ttsAudio = null;
+    }
+
+    this.ttsAudio = new Audio(segment.url);
+    this.ttsAudio.onended = () => {
+        this.ttsAudio = null;
+        this.playNextTTSSegment();
+    };
+
+    this.ttsAudio.onerror = (e) => {
+        console.error('TTS audio playback error:', e);
+        this.stopTTS();
+        this.updateTTSStatus('Playback error', 'error');
+    };
+
+    const langName = segment.language === 'en' ? 'English' : segment.language === 'zh' ? 'Chinese' : segment.language === 'ja' ? 'Japanese' : segment.language;
+    this.ttsAudio.play().then(() => {
+        const preview = segment.text || '';
+        this.updateTTSStatus(
+            `Playing ${currentSegment}/${totalSegments}: "${preview.substring(0, 50)}${preview.length > 50 ? '...' : ''}" (${langName})`,
+            'success'
+        );
+    }).catch((err) => {
+        console.error('Error playing TTS audio:', err);
+        this.stopTTS();
+        this.updateTTSStatus('Failed to play audio', 'error');
+    });
+};
+
+STTApp.prototype.handleTTSAudio = function(data) {
     try {
-        const audioData = atob(data.audio);
-        const audioArray = new Uint8Array(audioData.length);
-        for (let i = 0; i < audioData.length; i++) {
-            audioArray[i] = audioData.charCodeAt(i);
+        if (data && data.request_id && !this.ttsActiveRequestId) {
+            // No active request (e.g., user already pressed stop), ignore late packets.
+            return;
         }
-        const blob = new Blob([audioArray], { type: 'audio/wav' });
-        const audioUrl = URL.createObjectURL(blob);
-        this.ttsAudio = new Audio(audioUrl);
-        this.isTTSPlaying = true;
-        const idx = (data.index || 0) + 1;
-        const total = data.total || 1;
-        const langName = data.language === 'en' ? 'English' : data.language === 'zh' ? 'Chinese' : data.language === 'ja' ? 'Japanese' : data.language;
-        this.updateTTSStatus(`Playing segment ${idx}/${total} (${langName})`, 'success');
-        this.ttsAudio.onended = () => {
-            URL.revokeObjectURL(audioUrl);
-            this.ttsAudio = null;
-            this.isTTSPlaying = false;
-            this._playNextTTSChunk();
-        };
-        this.ttsAudio.onerror = (e) => {
-            console.error('TTS chunk playback error:', e);
-            URL.revokeObjectURL(audioUrl);
-            this.ttsAudio = null;
-            this.isTTSPlaying = false;
-            this._playNextTTSChunk();
-        };
-        this.ttsAudio.play().catch((err) => {
-            console.error('Error playing TTS chunk:', err);
-            URL.revokeObjectURL(audioUrl);
-            this.ttsAudio = null;
-            this.isTTSPlaying = false;
-            this._playNextTTSChunk();
+        if (data && data.request_id && this.ttsActiveRequestId && data.request_id !== this.ttsActiveRequestId) {
+            // Ignore stale segments from a previous request.
+            return;
+        }
+
+        // Backward compatibility: non-streaming payload with all segments.
+        if (Array.isArray(data.audio_segments) && data.audio_segments.length > 0) {
+            this.stopTTS({ clearStatus: false });
+            this.isTTSPlaying = true;
+            this.ttsExpectedSegments = data.audio_segments.length;
+            this.ttsStreamComplete = true;
+            this.ttsQueue = [];
+            data.audio_segments.forEach((segment) => {
+                if (!segment || !segment.audio) return;
+                this.ttsQueue.push({
+                    url: this.createTTSAudioUrl(segment.audio),
+                    text: segment.text || data.text || '',
+                    language: data.language || 'auto'
+                });
+            });
+            document.getElementById('ttsPlayBtn').disabled = true;
+            document.getElementById('ttsStopBtn').disabled = false;
+            if (!this.ttsAudio) this.playNextTTSSegment();
+            return;
+        }
+
+        if (!data || !data.audio) {
+            throw new Error('No playable TTS audio received');
+        }
+
+        this.ttsExpectedSegments = Number(data.segment_count) > 0 ? Number(data.segment_count) : this.ttsExpectedSegments;
+        this.ttsStreamComplete = Boolean(data.is_last) || this.ttsStreamComplete;
+        this.ttsQueue.push({
+            url: this.createTTSAudioUrl(data.audio),
+            text: data.text || '',
+            language: data.language || 'auto'
         });
+        this.isTTSPlaying = true;
+        document.getElementById('ttsPlayBtn').disabled = true;
+        document.getElementById('ttsStopBtn').disabled = false;
+        if (!this.ttsAudio) {
+            this.playNextTTSSegment();
+        }
+        
     } catch (error) {
-        console.error('Error playing TTS chunk:', error);
-        this.isTTSPlaying = false;
-        this._playNextTTSChunk();
+        console.error('Error handling TTS audio:', error);
+        this.stopTTS();
+        this.updateTTSStatus('Error processing audio', 'error');
     }
 };
 
 STTApp.prototype.handleTTSError = function(data) {
-    this.ttsStreamAborted = true;
-    this.ttsChunkQueue = [];
-    this.ttsStreamComplete = true;
+    if (data && data.request_id && this.ttsActiveRequestId && data.request_id !== this.ttsActiveRequestId) {
+        return;
+    }
     this.stopTTS();
     this.updateTTSStatus(data.message || 'TTS synthesis error', 'error');
     this.log(`TTS Error: ${data.message}`, 'error');

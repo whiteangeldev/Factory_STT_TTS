@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -108,6 +109,40 @@ def detect_language(text: str) -> str:
     
     # Default to English
     return "en"
+
+
+def _sanitize_tts_input_text(text: str) -> str:
+    """
+    Normalize text before synthesis.
+    - Removes citation markers like [1], [2][3], 【4】 that often cause odd prosody.
+    - Collapses repeated whitespace.
+    """
+    if not text:
+        return ""
+
+    cleaned = str(text)
+    cleaned = re.sub(r'\[\d+(?:\s*,\s*\d+)*\]', '', cleaned)
+    cleaned = re.sub(r'【\d+(?:\s*,\s*\d+)*】', '', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _remove_immediate_cjk_repetition(text: str) -> str:
+    """
+    Collapse immediate duplicated Chinese chunks, e.g. "中国和德国中国和德国" -> "中国和德国".
+    This only targets contiguous CJK repetitions to avoid altering normal prose.
+    """
+    if not text:
+        return ""
+
+    result = text
+    # Apply multiple passes in case there are nested/stacked repeats.
+    for _ in range(3):
+        updated = re.sub(r'([\u4e00-\u9fff]{2,16})\1+', r'\1', result)
+        if updated == result:
+            break
+        result = updated
+    return result
 
 def _apply_speed_adjustment(
     wav: np.ndarray,
@@ -289,6 +324,11 @@ def synthesize_speech(
     if not text:
         raise ValueError("Text must not be empty.")
 
+    original_text = text
+    text = _sanitize_tts_input_text(text)
+    if not text:
+        raise ValueError("Text is empty after sanitization.")
+
     # Auto-detect language if not specified or set to "auto"
     if language.lower().strip() in ("auto", ""):
         language = detect_language(text)
@@ -407,9 +447,11 @@ def synthesize_speech(
                 else:
                     logger.debug("Using cached PyKokoro pipeline (Chinese)")
                 
-                # Synthesize with PyKokoro (chunked for long-text stability)
+                # Synthesize with PyKokoro (chunked for long-text stability).
+                # Pre-collapse immediate CJK duplication to reduce repeated phrase artifacts.
+                text_for_zh = _remove_immediate_cjk_repetition(text)
                 audio_array, sampling_rate = _run_pykokoro_chunked(
-                    _pykokoro_cache_zh, text, lang='zh', max_chars=120
+                    _pykokoro_cache_zh, text_for_zh, lang='zh', max_chars=120
                 )
                 
                 # Ensure float32 format and normalize
@@ -435,6 +477,8 @@ def synthesize_speech(
                 try:
                     sf.write(output_buffer, np.clip(wav, -1.0, 1.0), samplerate=sampling_rate, format='WAV')
                     audio_bytes = output_buffer.getvalue()
+                    if original_text != text:
+                        logger.info(f"Chinese TTS input normalized: '{original_text[:40]}...' -> '{text[:40]}...'")
                     return audio_bytes, sampling_rate
                 finally:
                     output_buffer.close()

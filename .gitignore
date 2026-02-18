@@ -206,3 +206,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+fish-speech/
+GPT-SoVITS/
+test_fish_speech/
+test_gpt_sovits.py
+test_tts_models.py
+test_fish_speech.py
+test_blackhole.py
