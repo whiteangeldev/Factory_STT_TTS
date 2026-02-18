@@ -4,8 +4,8 @@ eventlet.monkey_patch()
 
 import base64
 import logging
-import re
 import numpy as np
+import re
 from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
@@ -28,14 +28,13 @@ from .audio.system_audio import SystemAudioCapture
 
 # Try to import TTS (optional - server can run without it)
 try:
-    from .audio.tts import synthesize_speech, detect_language
+    from .audio.tts import synthesize_speech
     _HAS_TTS = True
 except (ImportError, RuntimeError, PermissionError) as e:
     # Logger not yet defined, use print for early import errors
     print(f"Warning: TTS not available: {e}. TTS feature will be disabled.")
     _HAS_TTS = False
     synthesize_speech = None
-    detect_language = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -694,27 +693,24 @@ def handle_audio_chunk(data):
 
 @socketio.on('synthesize_speech')
 def handle_synthesize_speech(data):
-    """Handle TTS synthesis request - streams sentence-by-sentence for long context."""
+    """Handle TTS synthesis request"""
     client_id = request.sid
     request_id = None
     try:
-        if not _HAS_TTS or synthesize_speech is None or detect_language is None:
+        if not _HAS_TTS or synthesize_speech is None:
             emit('tts_error', {
                 'message': 'TTS is not available. Please install TTS dependencies:\n\n' +
                           'For English TTS:\n' +
                           '  pip install torch transformers datasets soundfile\n\n' +
                           'For Chinese/Japanese TTS:\n' +
-                          '  pip install pykokoro pyopenjtalk spacy cn2an jieba\n' +
-                          '  python -m spacy download en_core_web_sm\n' +
-                          '  python -m spacy download ja_core_news_sm\n' +
-                          '  python -m spacy download zh_core_web_sm\n\n' +
+                          '  pip install gtts pydub\n\n' +
                           'For speed adjustment:\n' +
                           '  pip install librosa'
             })
             return
         
         text = data.get('text', '').strip()
-        language = data.get('language', 'auto').strip()
+        language = data.get('language', 'auto').strip()  # Default to auto-detect
         speed = float(data.get('speed', 1.0))
         request_id = data.get('request_id') if isinstance(data, dict) else None
         
@@ -724,6 +720,8 @@ def handle_synthesize_speech(data):
         
         logger.info(f"[TTS] Synthesizing speech for {client_id[:8]}: text='{text[:50]}...', language={language} (auto-detect), speed={speed}")
 
+        # Detect the actual language used (in case it was auto-detected)
+        from .audio.tts import detect_language
         detected_lang = detect_language(text) if language == 'auto' else language
 
         # Split long text into sentence-level segments and synthesize in order.
@@ -746,8 +744,11 @@ def handle_synthesize_speech(data):
     except Exception as e:
         logger.error(f"Error in synthesize_speech: {e}", exc_info=True)
         error_payload = {'message': str(e)}
-        if request_id:
-            error_payload['request_id'] = request_id
+        try:
+            if request_id:
+                error_payload['request_id'] = request_id
+        except Exception:
+            pass
         emit('tts_error', error_payload)
 
 if __name__ == '__main__':

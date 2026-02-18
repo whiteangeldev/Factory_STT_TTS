@@ -19,7 +19,7 @@ class STTApp {
         this.vadHistory = [];
         this.currentVadState = false;
         
-        // TTS state (streaming: queue chunks, play one by one)
+        // TTS state
         this.ttsAudio = null;
         this.isTTSPlaying = false;
         this.ttsQueue = [];
@@ -82,10 +82,11 @@ class STTApp {
             this.log(data.message || 'Socket.IO ready - VAD and noise reduction active', 'success');
         });
         
-        // TTS event handlers (streaming segment-by-segment via tts_audio)
+        // TTS event handlers
         this.socket.on('tts_audio', (data) => {
             this.handleTTSAudio(data);
         });
+        
         this.socket.on('tts_error', (data) => {
             this.handleTTSError(data);
         });
