@@ -142,6 +142,159 @@ def _remove_immediate_cjk_repetition(text: str) -> str:
         result = updated
     return result
 
+
+def _normalize_lang_code(language: str) -> str:
+    """Normalize user-facing language labels to en/zh/ja."""
+    lang = (language or "").lower().strip()
+    if lang in ("zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"):
+        return "zh"
+    if lang in ("ja", "jpn", "japanese"):
+        return "ja"
+    return "en"
+
+
+def _has_mixed_scripts(text: str) -> bool:
+    """Detect if text mixes CJK and Latin scripts (common mixed-language case)."""
+    has_han = re.search(r'[\u4e00-\u9fff]', text) is not None
+    has_kana = re.search(r'[\u3040-\u30ff]', text) is not None
+    has_latin = re.search(r'[A-Za-z]', text) is not None
+    return (has_han and (has_latin or has_kana)) or (has_kana and (has_latin or has_han))
+
+
+def _classify_token_lang(token: str, default_lang: str) -> str | None:
+    """Assign a language class to one token; punctuation returns None."""
+    if re.search(r'[\u3040-\u30ff]', token):
+        return "ja"
+    if re.search(r'[A-Za-z]', token):
+        return "en"
+    if re.search(r'[\u4e00-\u9fff]', token):
+        return "zh"
+    if re.search(r'\d', token):
+        return default_lang
+    return None
+
+
+def _split_mixed_language_segments(text: str, default_lang: str = "zh") -> list[tuple[str, str]]:
+    """
+    Split mixed text into contiguous language segments.
+    Returns list of (segment_text, lang) using lang in {"en","zh","ja"}.
+    """
+    tokens = re.findall(
+        r"[A-Za-z]+(?:['-][A-Za-z]+)*|[\u3040-\u30ff]+|[\u4e00-\u9fff]+|\d+|[^\s]",
+        text
+    )
+    if not tokens:
+        return []
+
+    segments: list[tuple[str, str]] = []
+    current_text = ""
+    current_lang = None
+
+    def flush_current():
+        nonlocal current_text, current_lang
+        if current_text.strip() and current_lang:
+            segments.append((current_text.strip(), current_lang))
+        current_text = ""
+        current_lang = None
+
+    for token in tokens:
+        token_lang = _classify_token_lang(token, default_lang)
+        if token_lang is None:
+            # Keep punctuation in current segment for natural prosody.
+            if current_text:
+                current_text += token
+            continue
+
+        if current_lang is None:
+            current_lang = token_lang
+            current_text = token
+            continue
+
+        if token_lang == current_lang:
+            if current_lang == "en" and re.search(r'[A-Za-z0-9]$', current_text) and re.search(r'^[A-Za-z0-9]', token):
+                current_text += " " + token
+            else:
+                current_text += token
+        else:
+            flush_current()
+            current_lang = token_lang
+            current_text = token
+
+    flush_current()
+    return segments
+
+
+def _resample_linear(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Dependency-free fallback resampler."""
+    if src_sr == dst_sr:
+        return audio.astype(np.float32)
+    if len(audio) == 0:
+        return audio.astype(np.float32)
+
+    src_x = np.arange(len(audio), dtype=np.float64)
+    dst_len = max(1, int(round(len(audio) * float(dst_sr) / float(src_sr))))
+    dst_x = np.linspace(0, len(audio) - 1, num=dst_len, dtype=np.float64)
+    return np.interp(dst_x, src_x, audio.astype(np.float64)).astype(np.float32)
+
+
+def _resample_if_needed(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample audio to target sample-rate with librosa when available."""
+    if src_sr == dst_sr:
+        return audio.astype(np.float32)
+    if _HAS_LIBROSA:
+        return librosa.resample(audio.astype(np.float32), orig_sr=src_sr, target_sr=dst_sr).astype(np.float32)
+    return _resample_linear(audio, src_sr, dst_sr)
+
+
+def _synthesize_mixed_text(text: str, speed: float, device_preference: str, default_lang: str = "zh") -> tuple[bytes, int]:
+    """Synthesize mixed-language text by routing each segment to its language model."""
+    segments = _split_mixed_language_segments(text, default_lang=default_lang)
+    if not segments:
+        raise ValueError("No mixed-language segments to synthesize.")
+
+    logger.info(f"Mixed-language routing enabled: {[(s[:24], l) for s, l in segments]}")
+
+    stitched_audio = []
+    output_sr = None
+    boundary_pause = None
+
+    for segment_text, segment_lang in segments:
+        if not segment_text.strip():
+            continue
+
+        seg_bytes, seg_sr = synthesize_speech(
+            text=segment_text,
+            language=segment_lang,
+            speed=speed,
+            device_preference=device_preference
+        )
+        seg_audio, read_sr = sf.read(io.BytesIO(seg_bytes), dtype="float32")
+        if hasattr(seg_audio, "ndim") and seg_audio.ndim > 1:
+            seg_audio = np.mean(seg_audio, axis=1)
+        seg_audio = seg_audio.astype(np.float32)
+
+        if output_sr is None:
+            output_sr = int(read_sr)
+            boundary_pause = np.zeros(max(1, int(output_sr * 0.04)), dtype=np.float32)
+
+        seg_audio = _resample_if_needed(seg_audio, int(read_sr), int(output_sr))
+        stitched_audio.append(np.clip(seg_audio, -1.0, 1.0))
+        stitched_audio.append(boundary_pause)
+
+    if not stitched_audio:
+        raise RuntimeError("Mixed-language synthesis produced no audio.")
+
+    if len(stitched_audio) > 1:
+        stitched_audio = stitched_audio[:-1]  # drop trailing pause
+
+    merged = np.concatenate(stitched_audio).astype(np.float32)
+    output_buffer = io.BytesIO()
+    try:
+        sf.write(output_buffer, merged, samplerate=int(output_sr), format='WAV')
+        return output_buffer.getvalue(), int(output_sr)
+    finally:
+        output_buffer.close()
+
 def _apply_speed_adjustment(
     wav: np.ndarray,
     sr: int,
@@ -203,6 +356,16 @@ def synthesize_speech(
         logger.info(f"Auto-detected language: {language} for text: '{text[:50]}...'")
     
     language_lower = language.lower().strip()
+    normalized_lang = _normalize_lang_code(language_lower if language_lower not in ("", "auto") else "zh")
+
+    # In Chinese context with embedded English/Japanese, route each segment to the correct model.
+    if language_lower in ("auto", "", "zh", "cmn", "zho", "chinese", "mandarin", "zh-cn") and _has_mixed_scripts(text):
+        return _synthesize_mixed_text(
+            text=text,
+            speed=speed,
+            device_preference=device_preference,
+            default_lang=normalized_lang
+        )
     
     # For English: Use PyKokoro-82M (replacing MMS-TTS)
     if language_lower in ["en", "eng", "english"]:
