@@ -37,6 +37,9 @@ jieba>=0.42.1  # Required by PyKokoro for Chinese word segmentation
 ordered_set
 pypinyin
 
+# For MeloTTS (Chinese/Japanese) - required for mixed Chinese-English or Japanese-English text:
+nltk>=3.8  # Required by MeloTTS for processing English words in Chinese/Japanese text
+
 # For speed adjustment:
 librosa>=0.10.0
 

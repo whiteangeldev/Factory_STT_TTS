@@ -19,6 +19,11 @@ class STTApp {
         this.vadHistory = [];
         this.currentVadState = false;
         
+        // UI-only display state (separate from VAD detection to prevent flicker)
+        this.currentVadDisplayState = false;
+        this._vadUiHoldUntil = 0;
+        this.vadUiHoldMs = 800; // Hold "Speech Detected" for 800ms during brief dips
+        
         // TTS state
         this.ttsAudio = null;
         this.isTTSPlaying = false;
@@ -28,6 +33,7 @@ class STTApp {
         this.ttsActiveRequestId = null;
         this.ttsExpectedSegments = 0;
         this.ttsStreamComplete = false;
+        this.ttsAudioData = []; // Store audio data (base64) for saving
         
         this.init();
     }
@@ -197,6 +203,7 @@ class STTApp {
         // TTS event listeners
         document.getElementById('ttsPlayBtn').addEventListener('click', () => this.playTTS());
         document.getElementById('ttsStopBtn').addEventListener('click', () => this.stopTTS());
+        document.getElementById('ttsSaveBtn').addEventListener('click', () => this.saveTTS());
         document.getElementById('ttsSpeed').addEventListener('input', (e) => {
             document.getElementById('ttsSpeedValue').textContent = `${parseFloat(e.target.value).toFixed(1)}x`;
         });
@@ -802,8 +809,10 @@ class STTApp {
                     }
                 }
                 // Force silence state
-                if (this.currentVadState) {
+                if (this.currentVadState || this.currentVadDisplayState) {
                     this.currentVadState = false;
+                    this.currentVadDisplayState = false;
+                    this._vadUiHoldUntil = 0;
                     const vadDot = document.getElementById('vadDot');
                     const vadStatus = document.querySelector('.vad-text');
                     if (vadDot) vadDot.classList.remove('active');
@@ -844,11 +853,34 @@ class STTApp {
                 smoothedSpeech = (speechCount >= 2);  // Enter speech if 2+ chunks are speech
             }
             
-            // Only update UI if smoothed state changed (prevents swing)
+            // Update VAD detection state (core logic - unchanged)
             if (smoothedSpeech !== this.currentVadState) {
                 this.currentVadState = smoothedSpeech;
+            }
+            
+            // UI-only display state with hold mechanism to prevent flicker
+            const nowUi = Date.now();
+            const backendSaysSpeech = (data.speech_state === 'speech');
+            
+            // When speech is detected, set hold timer
+            if (smoothedSpeech || backendSaysSpeech) {
+                this._vadUiHoldUntil = nowUi + this.vadUiHoldMs;
+            }
+            
+            // Determine UI display state:
+            // - Show "Speech Detected" if smoothed state says speech OR we're within hold period
+            // - Only switch to "No Speech" if hold period expired AND backend says silence
+            let displaySpeech = smoothedSpeech || backendSaysSpeech || (
+                this.currentVadDisplayState &&
+                nowUi < this._vadUiHoldUntil &&
+                !backendSaysSilence
+            );
+            
+            // Update UI only if display state changed
+            if (displaySpeech !== this.currentVadDisplayState) {
+                this.currentVadDisplayState = displaySpeech;
                 
-                if (smoothedSpeech) {
+                if (displaySpeech) {
                     // Speech detected - show green dot
                     if (vadDot) vadDot.classList.add('active');
                     if (vadStatus) {
@@ -867,9 +899,9 @@ class STTApp {
                 }
             }
             
-            // Update header status (top center dot) using same smoothed VAD state as bottom dot
+            // Update header status (top center dot) using UI display state
             if (this.isRecording) {
-                if (smoothedSpeech) {
+                if (this.currentVadDisplayState) {
                     this.updateSystemStatus('speech_detected', 'Speech Detected');
                 } else {
                     if (data.speech_state === 'buffering') {
@@ -916,6 +948,8 @@ class STTApp {
             // Set a flag to prevent smoothing from overriding this
             this._speechEnded = true;
             this.currentVadState = false;
+            this.currentVadDisplayState = false;
+            this._vadUiHoldUntil = 0;
             this.vadHistory = [];  // Clear VAD history
             
             // Update VAD indicator UI immediately
@@ -1238,10 +1272,12 @@ STTApp.prototype.playTTS = function() {
     this.ttsExpectedSegments = 0;
     this.ttsStreamComplete = false;
     this.ttsCurrentIndex = 0;
+    this.ttsAudioData = []; // Clear previous audio data
     
     // Update UI
     document.getElementById('ttsPlayBtn').disabled = true;
     document.getElementById('ttsStopBtn').disabled = false;
+    document.getElementById('ttsSaveBtn').disabled = true; // Disable until audio is received
     this.updateTTSStatus('Detecting language and synthesizing first sentence...', 'info');
     
     // Request TTS synthesis (language will be auto-detected on server).
@@ -1265,12 +1301,19 @@ STTApp.prototype.stopTTS = function(options = {}) {
     this.ttsCurrentIndex = 0;
     this.ttsObjectUrls.forEach((url) => URL.revokeObjectURL(url));
     this.ttsObjectUrls = [];
+    // Preserve ttsStreamComplete and ttsAudioData to allow saving after stopping
+    // They will be cleared when starting a new TTS request in playTTS
+    const wasStreamComplete = this.ttsStreamComplete;
+    const hasAudioData = this.ttsAudioData.length > 0;
     this.ttsActiveRequestId = null;
     this.ttsExpectedSegments = 0;
-    this.ttsStreamComplete = false;
+    // Don't reset ttsStreamComplete here - preserve it so save button state is maintained
+    // It will be reset in playTTS when starting a new request
     this.isTTSPlaying = false;
     document.getElementById('ttsPlayBtn').disabled = false;
     document.getElementById('ttsStopBtn').disabled = true;
+    // Only enable save button if stream was complete and we have audio data
+    document.getElementById('ttsSaveBtn').disabled = !wasStreamComplete || !hasAudioData;
     if (clearStatus) {
         this.updateTTSStatus('', '');
     }
@@ -1293,6 +1336,7 @@ STTApp.prototype.playNextTTSSegment = function() {
 
     if (this.ttsQueue.length === 0) {
         if (this.ttsStreamComplete) {
+            // All segments received and playback completed
             this.stopTTS({ clearStatus: false });
             this.updateTTSStatus('Playback completed', 'success');
         } else {
@@ -1360,6 +1404,7 @@ STTApp.prototype.handleTTSAudio = function(data) {
             this.ttsQueue = [];
             data.audio_segments.forEach((segment) => {
                 if (!segment || !segment.audio) return;
+                this.ttsAudioData.push(segment.audio); // Store base64 audio for saving
                 this.ttsQueue.push({
                     url: this.createTTSAudioUrl(segment.audio),
                     text: segment.text || data.text || '',
@@ -1368,6 +1413,7 @@ STTApp.prototype.handleTTSAudio = function(data) {
             });
             document.getElementById('ttsPlayBtn').disabled = true;
             document.getElementById('ttsStopBtn').disabled = false;
+            document.getElementById('ttsSaveBtn').disabled = false; // Enable save button when all segments received
             if (!this.ttsAudio) this.playNextTTSSegment();
             return;
         }
@@ -1377,7 +1423,9 @@ STTApp.prototype.handleTTSAudio = function(data) {
         }
 
         this.ttsExpectedSegments = Number(data.segment_count) > 0 ? Number(data.segment_count) : this.ttsExpectedSegments;
+        const wasComplete = this.ttsStreamComplete;
         this.ttsStreamComplete = Boolean(data.is_last) || this.ttsStreamComplete;
+        this.ttsAudioData.push(data.audio); // Store base64 audio for saving
         this.ttsQueue.push({
             url: this.createTTSAudioUrl(data.audio),
             text: data.text || '',
@@ -1386,6 +1434,13 @@ STTApp.prototype.handleTTSAudio = function(data) {
         this.isTTSPlaying = true;
         document.getElementById('ttsPlayBtn').disabled = true;
         document.getElementById('ttsStopBtn').disabled = false;
+        // Enable save button when all segments are received (stream complete)
+        if (this.ttsStreamComplete && !wasComplete) {
+            document.getElementById('ttsSaveBtn').disabled = false;
+            this.log('All TTS segments received - audio ready to save', 'success');
+        } else if (!this.ttsStreamComplete) {
+            document.getElementById('ttsSaveBtn').disabled = true;
+        }
         if (!this.ttsAudio) {
             this.playNextTTSSegment();
         }
@@ -1419,4 +1474,132 @@ STTApp.prototype.updateTTSStatus = function(message, type) {
     statusEl.textContent = message;
     // Update class to match new CSS structure
     statusEl.className = type ? `tts-status ${type}` : 'tts-status';
+};
+
+STTApp.prototype.saveTTS = async function() {
+    if (this.ttsAudioData.length === 0) {
+        this.log('No TTS audio to save. Please generate audio first.', 'warning');
+        this.updateTTSStatus('No audio to save', 'warning');
+        return;
+    }
+    
+    try {
+        this.log('Saving TTS audio...', 'info');
+        this.updateTTSStatus('Saving audio...', 'info');
+        
+        // Decode all base64 WAV segments and extract PCM data
+        const audioBuffers = [];
+        let sampleRate = 24000; // Default, will be updated from first segment
+        
+        for (let i = 0; i < this.ttsAudioData.length; i++) {
+            const base64Audio = this.ttsAudioData[i];
+            const audioBytes = atob(base64Audio);
+            const buffer = new ArrayBuffer(audioBytes.length);
+            const view = new Uint8Array(buffer);
+            for (let j = 0; j < audioBytes.length; j++) {
+                view[j] = audioBytes.charCodeAt(j);
+            }
+            
+            // Parse WAV header to extract PCM data
+            const dataView = new DataView(buffer);
+            
+            // Check RIFF header
+            if (String.fromCharCode(dataView.getUint8(0), dataView.getUint8(1), dataView.getUint8(2), dataView.getUint8(3)) !== 'RIFF') {
+                throw new Error(`Invalid WAV format in segment ${i + 1}`);
+            }
+            
+            // Find 'data' chunk
+            let dataOffset = 44; // Standard WAV header size
+            let dataSize = dataView.getUint32(40, true);
+            
+            // If data chunk is not at standard position, search for it
+            if (String.fromCharCode(dataView.getUint8(36), dataView.getUint8(37), dataView.getUint8(38), dataView.getUint8(39)) !== 'data') {
+                // Search for 'data' chunk
+                for (let offset = 12; offset < buffer.byteLength - 8; offset++) {
+                    const chunkId = String.fromCharCode(
+                        dataView.getUint8(offset),
+                        dataView.getUint8(offset + 1),
+                        dataView.getUint8(offset + 2),
+                        dataView.getUint8(offset + 3)
+                    );
+                    if (chunkId === 'data') {
+                        dataOffset = offset + 8;
+                        dataSize = dataView.getUint32(offset + 4, true);
+                        break;
+                    }
+                }
+            }
+            
+            // Extract sample rate from fmt chunk (usually at offset 24)
+            if (i === 0) {
+                // Find 'fmt ' chunk
+                for (let offset = 12; offset < buffer.byteLength - 8; offset++) {
+                    const chunkId = String.fromCharCode(
+                        dataView.getUint8(offset),
+                        dataView.getUint8(offset + 1),
+                        dataView.getUint8(offset + 2),
+                        dataView.getUint8(offset + 3)
+                    );
+                    if (chunkId === 'fmt ') {
+                        sampleRate = dataView.getUint32(offset + 12, true);
+                        break;
+                    }
+                }
+            }
+            
+            // Extract PCM data (Int16 samples)
+            const pcmData = new Int16Array(buffer, dataOffset, dataSize / 2);
+            audioBuffers.push(pcmData);
+        }
+        
+        if (audioBuffers.length === 0) {
+            throw new Error('No valid audio data found');
+        }
+        
+        // Combine all PCM data
+        const totalLength = audioBuffers.reduce((sum, buf) => sum + buf.length, 0);
+        const combinedPCM = new Int16Array(totalLength);
+        let offset = 0;
+        for (const buffer of audioBuffers) {
+            combinedPCM.set(buffer, offset);
+            offset += buffer.length;
+        }
+        
+        // Convert Int16Array to Float32Array for WAV conversion
+        const float32Audio = new Float32Array(combinedPCM.length);
+        for (let i = 0; i < combinedPCM.length; i++) {
+            float32Audio[i] = combinedPCM[i] / 32768.0;
+        }
+        
+        // Convert to WAV
+        const wav = this.float32ToWav(float32Audio, sampleRate);
+        const blob = new Blob([wav], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        
+        // Generate filename with timestamp
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const filename = `tts_audio_${timestamp}.wav`;
+        
+        // Download
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        
+        URL.revokeObjectURL(url);
+        
+        const duration = (combinedPCM.length / sampleRate).toFixed(2);
+        this.log(`TTS audio saved: ${filename} (${duration}s, ${this.ttsAudioData.length} segments)`, 'success');
+        this.updateTTSStatus(`Audio saved: ${filename}`, 'success');
+        console.log(`✅ Successfully saved TTS audio: ${filename}`);
+        
+    } catch (error) {
+        console.error('❌ Error saving TTS audio:', error);
+        console.error('  Stack:', error.stack);
+        this.log(`Failed to save TTS audio: ${error.message}`, 'error');
+        this.updateTTSStatus('Failed to save audio', 'error');
+        alert(`Failed to save TTS audio: ${error.message}\n\nCheck console for details.`);
+    }
 };
