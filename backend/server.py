@@ -497,6 +497,27 @@ def handle_stop_recording(data=None):
     client_recording_state[client_id] = False
     client_audio_buffers[client_id] = np.array([], dtype=np.float32)
     
+    # CRITICAL: Stop pipeline processing first to ensure final transcription is generated
+    # Don't remove pipeline immediately - let it finish processing
+    pipeline = None
+    if client_id in client_pipelines:
+        pipeline = client_pipelines[client_id]
+        if pipeline:
+            # Stop the pipeline's STT stream to trigger final transcription
+            # This will process any remaining audio and generate the final transcription
+            try:
+                # Always call stop_stream to ensure final buffer is processed
+                # This is safe even if not currently speaking - it will just process any buffered audio
+                if hasattr(pipeline, 'streaming_stt') and pipeline.streaming_stt:
+                    if pipeline.streaming_stt.is_streaming:
+                        logger.info(f"🛑 Stopping STT stream for {client_id} to generate final transcription")
+                        pipeline.streaming_stt.stop_stream()
+                        # Wait for transcription to complete (stop_stream already waits internally, but add extra buffer)
+                        import time
+                        time.sleep(1.0)  # Additional wait to ensure transcription callback completes
+            except Exception as e:
+                logger.error(f"Error stopping pipeline STT: {e}", exc_info=True)
+    
     # Stop server-side system audio if active
     if client_id in client_system_audio:
         client_system_audio[client_id].stop()
@@ -514,7 +535,11 @@ def handle_stop_recording(data=None):
                 except:
                     break
     
-    client_pipelines.pop(client_id, None)
+    # Now remove the pipeline after transcription should be complete
+    # The pipeline callback will still work until this point, so transcriptions can be emitted
+    if client_id in client_pipelines:
+        client_pipelines.pop(client_id, None)
+    
     logger.info(f"🛑 Recording stopped: {client_id}")
     emit('recording_status', {'is_recording': False, 'status': 'Ready'})
 

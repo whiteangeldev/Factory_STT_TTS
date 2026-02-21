@@ -99,13 +99,18 @@ class STTApp {
         
         this.socket.on('recording_status', (data) => {
             console.log('📊 Recording status update:', data);
+            const recordBtn = document.getElementById('recordBtn');
+            const recordBtnText = document.getElementById('recordBtnText');
+            
             if (data.is_recording) {
                 this.updateSystemStatus('listening', data.status || 'Recording...');
                 if (!this.isRecording) {
                     // Server confirmed recording started
                     this.isRecording = true;
-                    document.getElementById('startBtn').disabled = true;
-                    document.getElementById('stopBtn').disabled = false;
+                    recordBtn.classList.add('recording');
+                    if (recordBtnText) {
+                        recordBtnText.textContent = 'Recording...';
+                    }
                     document.getElementById('saveBtn').disabled = false;
                 }
             } else {
@@ -113,8 +118,10 @@ class STTApp {
                 if (this.isRecording) {
                     // Server confirmed recording stopped
                     this.isRecording = false;
-                    document.getElementById('startBtn').disabled = false;
-                    document.getElementById('stopBtn').disabled = true;
+                    recordBtn.classList.remove('recording');
+                    if (recordBtnText) {
+                        recordBtnText.textContent = 'Hold to Record';
+                    }
                 }
             }
         });
@@ -191,9 +198,55 @@ class STTApp {
     }
     
     setupEventListeners() {
-        // Recording controls
-        document.getElementById('startBtn').addEventListener('click', () => this.startRecording());
-        document.getElementById('stopBtn').addEventListener('click', () => this.stopRecording());
+        // Recording controls - press and hold to record
+        const recordBtn = document.getElementById('recordBtn');
+        const recordBtnText = document.getElementById('recordBtnText');
+        
+        // Mouse events
+        recordBtn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            if (!this.isRecording) {
+                this.startRecording();
+            }
+        });
+        
+        recordBtn.addEventListener('mouseup', (e) => {
+            e.preventDefault();
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+        });
+        
+        recordBtn.addEventListener('mouseleave', (e) => {
+            // Stop recording if mouse leaves button while pressed
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+        });
+        
+        // Touch events for mobile
+        recordBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            if (!this.isRecording) {
+                this.startRecording();
+            }
+        }, { passive: false });
+        
+        recordBtn.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+        }, { passive: false });
+        
+        recordBtn.addEventListener('touchcancel', (e) => {
+            e.preventDefault();
+            if (this.isRecording) {
+                this.stopRecording();
+            }
+        }, { passive: false });
+        
+        // Save button
         document.getElementById('saveBtn').addEventListener('click', () => this.saveRecording());
         
         // Input mode toggle buttons
@@ -331,10 +384,7 @@ class STTApp {
                 console.log('🎙️ System audio mode: Ready to receive audio from server');
                 console.log('   Waiting for processed_audio events...');
                 
-                // Clear transcription area
-                const area = document.getElementById('transcriptionArea');
-                area.innerHTML = '';
-                
+                // Don't clear transcription area - keep previous transcriptions
                 // Notify backend to start server-side capture
                 if (this.socket && this.socket.connected) {
                     this.socket.emit('start_recording', {
@@ -344,8 +394,12 @@ class STTApp {
                 }
                 
                 // Update UI
-                document.getElementById('startBtn').disabled = true;
-                document.getElementById('stopBtn').disabled = false;
+                const recordBtn = document.getElementById('recordBtn');
+                const recordBtnText = document.getElementById('recordBtnText');
+                recordBtn.classList.add('recording');
+                if (recordBtnText) {
+                    recordBtnText.textContent = 'Recording...';
+                }
                 document.getElementById('saveBtn').disabled = false;
                 
                 this.updateSystemStatus('listening', 'Listening (system audio)...');
@@ -407,10 +461,7 @@ class STTApp {
             this.transcriptionCount = 0;
             this.recordingStartTime = Date.now() / 1000;
             
-            // Clear transcription area
-            const area = document.getElementById('transcriptionArea');
-            area.innerHTML = '';
-            
+            // Don't clear transcription area - keep previous transcriptions
             // Setup audio processing using AudioWorkletNode (modern) or fallback to ScriptProcessor
             const source = this.audioContext.createMediaStreamSource(stream);
             
@@ -464,8 +515,12 @@ class STTApp {
             }
             
             // Update UI
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('stopBtn').disabled = false;
+            const recordBtn = document.getElementById('recordBtn');
+            const recordBtnText = document.getElementById('recordBtnText');
+            recordBtn.classList.add('recording');
+            if (recordBtnText) {
+                recordBtnText.textContent = 'Recording...';
+            }
             document.getElementById('saveBtn').disabled = false;
             
             this.updateSystemStatus('listening', 'Listening...');
@@ -498,8 +553,12 @@ class STTApp {
             alert(errorMsg);
             
             // Reset UI
-            document.getElementById('startBtn').disabled = false;
-            document.getElementById('stopBtn').disabled = true;
+            const recordBtn = document.getElementById('recordBtn');
+            const recordBtnText = document.getElementById('recordBtnText');
+            recordBtn.classList.remove('recording');
+            if (recordBtnText) {
+                recordBtnText.textContent = 'Hold to Record';
+            }
         }
     }
     
@@ -553,8 +612,12 @@ class STTApp {
         }
         // For system audio mode: server handles stopping, just update UI
         
-        document.getElementById('startBtn').disabled = false;
-        document.getElementById('stopBtn').disabled = true;
+        const recordBtn = document.getElementById('recordBtn');
+        const recordBtnText = document.getElementById('recordBtnText');
+        recordBtn.classList.remove('recording');
+        if (recordBtnText) {
+            recordBtnText.textContent = 'Hold to Record';
+        }
         
         this.updateSystemStatus('ready', 'Ready');
         
@@ -921,12 +984,6 @@ class STTApp {
             }
         }
         
-        if (data.vad_probability !== undefined) {
-            const vadProbEl = document.getElementById('vadProbability');
-            if (vadProbEl) {
-                vadProbEl.textContent = data.vad_probability.toFixed(3);
-            }
-        }
         
         if (data.speech_state) {
             const speechStateEl = document.getElementById('speechState');
@@ -996,11 +1053,6 @@ class STTApp {
         const item = document.createElement('div');
         item.className = 'transcription-entry final';
         
-        // Add confidence indicator if available
-        const confidence = data.confidence || 1.0;
-        const confidenceClass = confidence >= 0.9 ? 'high' : confidence >= 0.7 ? 'medium' : 'low';
-        const confidenceBadge = `<span class="confidence-badge ${confidenceClass}">${(confidence * 100).toFixed(0)}%</span>`;
-        
         // Language detection badge
         const lang = data.language || 'auto';
         const langBadge = `<span class="lang-badge">${lang.toUpperCase()}</span>`;
@@ -1009,7 +1061,6 @@ class STTApp {
             <div class="transcription-text">${this.escapeHtml(text)}</div>
             <div class="transcription-meta">
                 ${langBadge}
-                ${confidenceBadge}
                 ${latencyInfo}
             </div>
         `;
@@ -1063,14 +1114,11 @@ class STTApp {
         // Add new interim entry with better visual feedback
         const item = document.createElement('div');
         item.className = 'transcription-entry interim';
-        const confidence = data.confidence || 0.8;
-        const confidenceBadge = `<span class="confidence-badge interim">${(confidence * 100).toFixed(0)}%</span>`;
         
         item.innerHTML = `
             <div class="transcription-text">${this.escapeHtml(text)}</div>
             <div class="transcription-meta">
                 <span class="lang-badge">PROCESSING</span>
-                ${confidenceBadge}
                 ${latencyInfo}
             </div>
         `;
@@ -1312,8 +1360,15 @@ STTApp.prototype.stopTTS = function(options = {}) {
     this.isTTSPlaying = false;
     document.getElementById('ttsPlayBtn').disabled = false;
     document.getElementById('ttsStopBtn').disabled = true;
-    // Only enable save button if stream was complete and we have audio data
-    document.getElementById('ttsSaveBtn').disabled = !wasStreamComplete || !hasAudioData;
+    // Enable save button only if all audio was received and we have data
+    // Note: If playback completed naturally, playNextTTSSegment already enabled it
+    // This covers the case where user manually stops after all audio was received
+    const saveBtn = document.getElementById('ttsSaveBtn');
+    if (wasStreamComplete && hasAudioData) {
+        saveBtn.disabled = false;
+    } else {
+        saveBtn.disabled = true;
+    }
     if (clearStatus) {
         this.updateTTSStatus('', '');
     }
@@ -1336,7 +1391,9 @@ STTApp.prototype.playNextTTSSegment = function() {
 
     if (this.ttsQueue.length === 0) {
         if (this.ttsStreamComplete) {
-            // All segments received and playback completed
+            // All segments received and playback completed - enable save button
+            document.getElementById('ttsSaveBtn').disabled = false;
+            this.log('All audio finished playing - ready to save', 'success');
             this.stopTTS({ clearStatus: false });
             this.updateTTSStatus('Playback completed', 'success');
         } else {
@@ -1413,7 +1470,8 @@ STTApp.prototype.handleTTSAudio = function(data) {
             });
             document.getElementById('ttsPlayBtn').disabled = true;
             document.getElementById('ttsStopBtn').disabled = false;
-            document.getElementById('ttsSaveBtn').disabled = false; // Enable save button when all segments received
+            // Keep save button disabled until all audio finishes playing
+            document.getElementById('ttsSaveBtn').disabled = true;
             if (!this.ttsAudio) this.playNextTTSSegment();
             return;
         }
@@ -1423,7 +1481,6 @@ STTApp.prototype.handleTTSAudio = function(data) {
         }
 
         this.ttsExpectedSegments = Number(data.segment_count) > 0 ? Number(data.segment_count) : this.ttsExpectedSegments;
-        const wasComplete = this.ttsStreamComplete;
         this.ttsStreamComplete = Boolean(data.is_last) || this.ttsStreamComplete;
         this.ttsAudioData.push(data.audio); // Store base64 audio for saving
         this.ttsQueue.push({
@@ -1434,13 +1491,9 @@ STTApp.prototype.handleTTSAudio = function(data) {
         this.isTTSPlaying = true;
         document.getElementById('ttsPlayBtn').disabled = true;
         document.getElementById('ttsStopBtn').disabled = false;
-        // Enable save button when all segments are received (stream complete)
-        if (this.ttsStreamComplete && !wasComplete) {
-            document.getElementById('ttsSaveBtn').disabled = false;
-            this.log('All TTS segments received - audio ready to save', 'success');
-        } else if (!this.ttsStreamComplete) {
-            document.getElementById('ttsSaveBtn').disabled = true;
-        }
+        // Keep save button disabled until all audio finishes playing
+        // It will be enabled in playNextTTSSegment when playback completes
+        document.getElementById('ttsSaveBtn').disabled = true;
         if (!this.ttsAudio) {
             this.playNextTTSSegment();
         }

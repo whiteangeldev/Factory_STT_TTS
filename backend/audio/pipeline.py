@@ -185,7 +185,14 @@ class AudioPipeline:
                     if not self._stopping_stt:
                         self._stopping_stt = True
                         self._stopping_chunks = 0
-                        logger.info("Starting extended stopping period to capture end of speech")
+                        # CRITICAL: Set is_speaking to False immediately when silence is detected
+                        # This ensures frontend shows "No Speech" right away, even though we continue
+                        # processing trailing audio for a bit longer to capture the end of speech
+                        self.is_speaking = False
+                        logger.info("Speech ended - silence detected, continuing to process trailing audio")
+                        # Emit speech_end event immediately so frontend updates status
+                        duration = time.time() - self.speech_start_time if self.speech_start_time else 0
+                        self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})
                     
                     self._stopping_chunks += 1
                     
@@ -194,18 +201,15 @@ class AudioPipeline:
                         # Continue sending during this extended period - already sent above
                         pass
                     else:
-                        # Now actually stop - set is_speaking to False FIRST so processed_audio events reflect silence
-                        self.is_speaking = False
-                        
+                        # Now actually stop STT processing
                         # Longer delay to ensure last audio chunks are queued and processed
                         time.sleep(0.7)  # Increased from 0.5 to ensure all chunks are sent
                         
                         duration = time.time() - self.speech_start_time if self.speech_start_time else 0
-                        logger.info(f"Speech ended - stopping STT, duration={duration:.2f}s")
+                        logger.info(f"Stopping STT processing, duration={duration:.2f}s")
                         # stop_stream will handle waiting for final transcription
                         self.streaming_stt.stop_stream()
                         self.stt_stop_time = time.time()
-                        self._emit_event("speech_end", {"timestamp": time.time(), "duration": duration})
                         self.speech_chunk_count = 0
                         self.silence_chunk_count = 0
                         self._stopping_stt = False

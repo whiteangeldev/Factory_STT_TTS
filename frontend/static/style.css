@@ -344,11 +344,18 @@ body::before {
     gap: var(--spacing-md);
     margin-bottom: var(--spacing-lg);
     flex-wrap: nowrap;
+    justify-content: center;
+    align-items: center;
 }
 
 .control-panel .btn-large {
     flex: 1;
     min-width: 0;
+}
+
+.control-panel .btn-recording {
+    flex: 2;
+    min-width: 200px;
 }
 
 /* Button Styles */
@@ -424,6 +431,74 @@ body::before {
     opacity: 0.5;
     cursor: not-allowed;
     transform: none !important;
+}
+
+/* Recording Button Styles */
+.btn-recording {
+    background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-secondary) 100%);
+    color: var(--text-primary);
+    border: 2px solid var(--border-color);
+    position: relative;
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    transition: all var(--transition-base);
+}
+
+.btn-recording:hover:not(.recording) {
+    background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-tertiary) 100%);
+    border-color: var(--primary);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+}
+
+.btn-recording.recording {
+    background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%);
+    color: white;
+    border-color: var(--error);
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+    animation: recordingPulse 1.5s ease-in-out infinite;
+}
+
+.btn-recording.recording::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--error);
+    opacity: 0.3;
+    animation: recordingRipple 1.5s ease-out infinite;
+    pointer-events: none;
+}
+
+@keyframes recordingPulse {
+    0%, 100% {
+        box-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+    }
+    50% {
+        box-shadow: 0 0 30px rgba(239, 68, 68, 0.8);
+    }
+}
+
+@keyframes recordingRipple {
+    0% {
+        transform: translate(-50%, -50%) scale(1);
+        opacity: 0.3;
+    }
+    100% {
+        transform: translate(-50%, -50%) scale(1.2);
+        opacity: 0;
+    }
+}
+
+.btn-recording svg {
+    width: 24px;
+    height: 24px;
 }
 
 .btn-icon {
