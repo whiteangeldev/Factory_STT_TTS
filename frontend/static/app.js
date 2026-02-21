@@ -100,7 +100,6 @@ class STTApp {
         this.socket.on('recording_status', (data) => {
             console.log('📊 Recording status update:', data);
             const recordBtn = document.getElementById('recordBtn');
-            const recordBtnText = document.getElementById('recordBtnText');
             
             if (data.is_recording) {
                 this.updateSystemStatus('listening', data.status || 'Recording...');
@@ -108,9 +107,6 @@ class STTApp {
                     // Server confirmed recording started
                     this.isRecording = true;
                     recordBtn.classList.add('recording');
-                    if (recordBtnText) {
-                        recordBtnText.textContent = 'Recording...';
-                    }
                     document.getElementById('saveBtn').disabled = false;
                 }
             } else {
@@ -119,9 +115,6 @@ class STTApp {
                     // Server confirmed recording stopped
                     this.isRecording = false;
                     recordBtn.classList.remove('recording');
-                    if (recordBtnText) {
-                        recordBtnText.textContent = 'Hold to Record';
-                    }
                 }
             }
         });
@@ -371,10 +364,10 @@ class STTApp {
                 this.isStopping = false;
                 this.audioChunks = [];
                 this.transcriptionBuffer = [];
-                this.transcriptionHistory = [];
+                // Don't reset transcriptionHistory - keep it for stats
+                // Don't reset transcriptionCount - count from DOM instead
                 this.currentInterimText = '';
                 this.lastTranscriptionTime = null;
-                this.transcriptionCount = 0;
                 this.recordingStartTime = Date.now() / 1000;
                 
                 // Reset counters for logging
@@ -395,11 +388,7 @@ class STTApp {
                 
                 // Update UI
                 const recordBtn = document.getElementById('recordBtn');
-                const recordBtnText = document.getElementById('recordBtnText');
                 recordBtn.classList.add('recording');
-                if (recordBtnText) {
-                    recordBtnText.textContent = 'Recording...';
-                }
                 document.getElementById('saveBtn').disabled = false;
                 
                 this.updateSystemStatus('listening', 'Listening (system audio)...');
@@ -455,10 +444,10 @@ class STTApp {
             this.isStopping = false;  // Reset stopping flag when starting
             this.audioChunks = [];
             this.transcriptionBuffer = [];
-            this.transcriptionHistory = [];
+            // Don't reset transcriptionHistory - keep it for stats
+            // Don't reset transcriptionCount - count from DOM instead
             this.currentInterimText = '';
             this.lastTranscriptionTime = null;
-            this.transcriptionCount = 0;
             this.recordingStartTime = Date.now() / 1000;
             
             // Don't clear transcription area - keep previous transcriptions
@@ -516,11 +505,7 @@ class STTApp {
             
             // Update UI
             const recordBtn = document.getElementById('recordBtn');
-            const recordBtnText = document.getElementById('recordBtnText');
             recordBtn.classList.add('recording');
-            if (recordBtnText) {
-                recordBtnText.textContent = 'Recording...';
-            }
             document.getElementById('saveBtn').disabled = false;
             
             this.updateSystemStatus('listening', 'Listening...');
@@ -553,12 +538,8 @@ class STTApp {
             alert(errorMsg);
             
             // Reset UI
-            const recordBtn = document.getElementById('recordBtn');
-            const recordBtnText = document.getElementById('recordBtnText');
-            recordBtn.classList.remove('recording');
-            if (recordBtnText) {
-                recordBtnText.textContent = 'Hold to Record';
-            }
+        const recordBtn = document.getElementById('recordBtn');
+        recordBtn.classList.remove('recording');
         }
     }
     
@@ -613,11 +594,7 @@ class STTApp {
         // For system audio mode: server handles stopping, just update UI
         
         const recordBtn = document.getElementById('recordBtn');
-        const recordBtnText = document.getElementById('recordBtnText');
         recordBtn.classList.remove('recording');
-        if (recordBtnText) {
-            recordBtnText.textContent = 'Hold to Record';
-        }
         
         this.updateSystemStatus('ready', 'Ready');
         
@@ -1072,12 +1049,11 @@ class STTApp {
         this.transcriptionHistory.push({
             text: text,
             timestamp: data.timestamp || Date.now() / 1000,
-            confidence: confidence,
+            confidence: data.confidence || 1.0,
             is_final: true
         });
-        this.transcriptionCount++;
         
-        // Update transcription count in UI
+        // Update transcription count based on actual DOM entries
         this.updateTranscriptionStats();
         
         this.log(`Final transcription: ${text.substring(0, 50)}...`, 'success');
@@ -1142,10 +1118,19 @@ class STTApp {
     }
     
     updateTranscriptionStats() {
-        // Update transcription count if element exists
+        // Update transcription count based on actual DOM entries
         const statsEl = document.getElementById('transcriptionStats');
         if (statsEl) {
-            statsEl.textContent = `${this.transcriptionCount} transcriptions`;
+            const area = document.getElementById('transcriptionArea');
+            if (area) {
+                // Count all final transcription entries in the DOM
+                const finalEntries = area.querySelectorAll('.transcription-entry.final');
+                const count = finalEntries.length;
+                statsEl.textContent = `${count} ${count === 1 ? 'transcription' : 'transcriptions'}`;
+            } else {
+                // Fallback to stored count if area doesn't exist
+                statsEl.textContent = `${this.transcriptionHistory.length} ${this.transcriptionHistory.length === 1 ? 'transcription' : 'transcriptions'}`;
+            }
         }
     }
     
