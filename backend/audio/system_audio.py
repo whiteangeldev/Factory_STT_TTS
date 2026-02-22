@@ -8,9 +8,18 @@ from typing import Optional, Callable
 logger = logging.getLogger(__name__)
 
 class SystemAudioCapture:
-    """Capture system audio directly on the server (no browser screen sharing needed)"""
+    """Capture audio directly on the server (system audio or microphone)"""
     
-    def __init__(self, sample_rate=16000, chunk_size=480, on_audio: Optional[Callable] = None):
+    def __init__(self, sample_rate=16000, chunk_size=480, on_audio: Optional[Callable] = None, input_type='system'):
+        """
+        Initialize audio capture.
+        
+        Args:
+            sample_rate: Target sample rate
+            chunk_size: Chunk size in samples
+            on_audio: Callback for audio chunks
+            input_type: 'system' for system audio, 'microphone' for microphone input
+        """
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.on_audio = on_audio
@@ -18,9 +27,10 @@ class SystemAudioCapture:
         self.stream = None
         self.thread = None
         self.audio_queue = queue.Queue()
+        self.input_type = input_type  # 'system' or 'microphone'
         
     def _detect_backend(self):
-        """Detect available audio backend for system audio - prefer pyaudio (works better in Flask/eventlet)"""
+        """Detect available audio backend and device based on input type"""
         import platform
         system = platform.system()
         
@@ -28,25 +38,53 @@ class SystemAudioCapture:
         try:
             import pyaudio
             p = pyaudio.PyAudio()
-            keywords = ['loopback', 'stereo mix', 'what u hear', 'monitor', 'virtual', 'blackhole', 'soundflower']
             
-            logger.info("Checking for system audio devices with pyaudio...")
+            if self.input_type == 'system':
+                # Look for system audio/loopback devices
+                keywords = ['loopback', 'stereo mix', 'what u hear', 'monitor', 'virtual', 'blackhole', 'soundflower']
+                logger.info("Checking for system audio devices with pyaudio...")
+            else:
+                # Look for microphone devices (exclude system audio keywords)
+                keywords = []
+                exclude_keywords = ['loopback', 'stereo mix', 'what u hear', 'monitor', 'virtual', 'blackhole', 'soundflower']
+                logger.info("Checking for microphone devices with pyaudio...")
+            
             device_count = p.get_device_count()
             logger.info(f"pyaudio found {device_count} total devices")
+            
+            default_input = p.get_default_input_device_info()
+            default_index = default_input['index']
+            
             for i in range(device_count):
                 try:
                     info = p.get_device_info_by_index(i)
                     name = info['name'].lower()
                     if info['maxInputChannels'] > 0:
-                        # Log all input devices for debugging
-                        if any(kw in name for kw in keywords):
-                            logger.info(f"Found system audio device (pyaudio): {info['name']} (index {i}, {info['maxInputChannels']}ch)")
-                            p.terminate()
-                            return 'pyaudio', i
+                        if self.input_type == 'system':
+                            # System audio: look for loopback devices
+                            if any(kw in name for kw in keywords):
+                                logger.info(f"Found system audio device (pyaudio): {info['name']} (index {i}, {info['maxInputChannels']}ch)")
+                                p.terminate()
+                                return 'pyaudio', i
+                        else:
+                            # Microphone: use default input or first non-loopback device
+                            if i == default_index:
+                                logger.info(f"Found default microphone device (pyaudio): {info['name']} (index {i}, {info['maxInputChannels']}ch)")
+                                p.terminate()
+                                return 'pyaudio', i
+                            elif not any(exclude_kw in name for exclude_kw in exclude_keywords):
+                                # Use first non-loopback device as fallback
+                                logger.info(f"Found microphone device (pyaudio): {info['name']} (index {i}, {info['maxInputChannels']}ch)")
+                                p.terminate()
+                                return 'pyaudio', i
                 except Exception as e:
                     logger.debug(f"Error checking pyaudio device {i}: {e}")
+            
             p.terminate()
-            logger.info("pyaudio: No system audio device found, falling back to sounddevice")
+            if self.input_type == 'system':
+                logger.info("pyaudio: No system audio device found, falling back to sounddevice")
+            else:
+                logger.info("pyaudio: No microphone device found, falling back to sounddevice")
         except ImportError:
             logger.warning("pyaudio not available, falling back to sounddevice")
         except Exception as e:
@@ -58,20 +96,24 @@ class SystemAudioCapture:
             devices = sd.query_devices()
             default_input = sd.default.device[0]  # Get default input device index
             
-            # Look for system audio/loopback devices
-            keywords = ['loopback', 'stereo mix', 'what u hear', 'monitor', 'virtual', 'blackhole', 'soundflower']
-            
-            for i, device in enumerate(devices):
-                name_lower = device['name'].lower()
-                # Check if it's a system audio device
-                if device['max_input_channels'] > 0:
-                    if any(keyword in name_lower for keyword in keywords):
-                        logger.info(f"Found system audio device: {device['name']} (index {i})")
-                        return 'sounddevice', i
-                    # On macOS, look for devices with "Monitor" in name
-                    if system == 'Darwin' and 'monitor' in name_lower:
-                        logger.info(f"Found macOS monitor device: {device['name']} (index {i})")
-                        return 'sounddevice', i
+            if self.input_type == 'system':
+                # Look for system audio/loopback devices
+                keywords = ['loopback', 'stereo mix', 'what u hear', 'monitor', 'virtual', 'blackhole', 'soundflower']
+                
+                for i, device in enumerate(devices):
+                    name_lower = device['name'].lower()
+                    if device['max_input_channels'] > 0:
+                        if any(keyword in name_lower for keyword in keywords):
+                            logger.info(f"Found system audio device: {device['name']} (index {i})")
+                            return 'sounddevice', i
+                        # On macOS, look for devices with "Monitor" in name
+                        if system == 'Darwin' and 'monitor' in name_lower:
+                            logger.info(f"Found macOS monitor device: {device['name']} (index {i})")
+                            return 'sounddevice', i
+            else:
+                # Microphone: use default input device
+                logger.info(f"Using default microphone device: {devices[default_input]['name']} (index {default_input})")
+                return 'sounddevice', default_input
             
             # List all available devices for debugging
             logger.info("Available audio input devices:")
@@ -84,14 +126,16 @@ class SystemAudioCapture:
             
             if not has_input:
                 logger.warning("No audio input devices found!")
-                logger.info("💡 On macOS, you may need to:")
-                logger.info("   1. Install BlackHole: https://github.com/ExistentialAudio/BlackHole")
-                logger.info("   2. Or enable 'Monitor' devices in Audio MIDI Setup")
+                if self.input_type == 'system':
+                    logger.info("💡 On macOS, you may need to:")
+                    logger.info("   1. Install BlackHole: https://github.com/ExistentialAudio/BlackHole")
+                    logger.info("   2. Or enable 'Monitor' devices in Audio MIDI Setup")
                 return None, None
             
-            # Try default input device (might work on some systems)
-            logger.info(f"Using default input device: {devices[default_input]['name']} (index {default_input})")
-            return 'sounddevice', default_input
+            # For system audio, try default input device as fallback
+            if self.input_type == 'system':
+                logger.info(f"Using default input device: {devices[default_input]['name']} (index {default_input})")
+                return 'sounddevice', default_input
         except ImportError:
             logger.warning("sounddevice not installed. Install with: pip install sounddevice")
         except Exception as e:

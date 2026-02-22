@@ -439,57 +439,58 @@ def handle_start_recording(data=None):
     client_pipelines[client_id] = AudioPipeline(config, event_callback=client_speech_callback)
     client_pipelines[client_id].reset()
     
-    # System audio: always use server-side capture
-    if input_mode == 'system':
-        try:
-            # Use a queue to pass audio from background thread to eventlet context
-            import queue
-            audio_event_queue = queue.Queue(maxsize=100)  # Limit queue size
-            client_audio_queues[client_id] = audio_event_queue
-            
-            def on_audio_chunk(audio_data):
-                """Callback for server-side system audio - queues for eventlet processing"""
-                if not client_recording_state.get(client_id, False):
-                    return
-                # Queue the audio data for processing in eventlet context
+    # Both system audio and microphone: use server-side capture
+    try:
+        # Use a queue to pass audio from background thread to eventlet context
+        import queue
+        audio_event_queue = queue.Queue(maxsize=100)  # Limit queue size
+        client_audio_queues[client_id] = audio_event_queue
+        
+        def on_audio_chunk(audio_data):
+            """Callback for server-side audio - queues for eventlet processing"""
+            if not client_recording_state.get(client_id, False):
+                return
+            # Queue the audio data for processing in eventlet context
+            try:
+                audio_event_queue.put_nowait((client_id, audio_data))
+            except queue.Full:
+                pass  # Drop if queue is full (backpressure)
+        
+        # Start background task to process queued audio in eventlet context
+        def process_audio_queue():
+            while client_recording_state.get(client_id, False) and client_id in client_audio_queues:
                 try:
-                    audio_event_queue.put_nowait((client_id, audio_data))
-                except queue.Full:
-                    pass  # Drop if queue is full (backpressure)
-            
-            # Start background task to process queued audio in eventlet context
-            def process_audio_queue():
-                while client_recording_state.get(client_id, False) and client_id in client_audio_queues:
-                    try:
-                        queued_client_id, audio_data = audio_event_queue.get(timeout=0.1)
-                        if queued_client_id in client_pipelines and client_pipelines[queued_client_id]:
-                            _process_audio_chunk(queued_client_id, audio_data)
-                    except queue.Empty:
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error processing queued audio: {e}")
-            
-            socketio.start_background_task(process_audio_queue)
-            
-            system_capture = SystemAudioCapture(
-                sample_rate=config.SAMPLE_RATE,
-                chunk_size=MIN_CHUNK_SIZE,
-                on_audio=on_audio_chunk
-            )
-            if system_capture.start():
-                client_system_audio[client_id] = system_capture
-                logger.info(f"🎙️ System audio started: {client_id}")
-                emit('recording_status', {'is_recording': True, 'status': 'Recording system audio...'})
-            else:
-                logger.error(f"⚠️ Failed to start system audio for {client_id}")
-                emit('recording_status', {'is_recording': False, 'status': 'Failed to start system audio. Check server logs.'})
-        except Exception as e:
-            logger.error(f"Failed to start system audio: {e}")
-            emit('recording_status', {'is_recording': False, 'status': f'System audio error: {str(e)}'})
-    else:
-        # Microphone mode: browser sends audio
-        logger.info(f"🎙️ Microphone recording started: {client_id}")
-        emit('recording_status', {'is_recording': True, 'status': 'Recording...'})
+                    queued_client_id, audio_data = audio_event_queue.get(timeout=0.1)
+                    if queued_client_id in client_pipelines and client_pipelines[queued_client_id]:
+                        _process_audio_chunk(queued_client_id, audio_data)
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing queued audio: {e}")
+        
+        socketio.start_background_task(process_audio_queue)
+        
+        # Create audio capture with appropriate input type
+        audio_capture = SystemAudioCapture(
+            sample_rate=config.SAMPLE_RATE,
+            chunk_size=MIN_CHUNK_SIZE,
+            on_audio=on_audio_chunk,
+            input_type=input_mode  # 'system' or 'microphone'
+        )
+        
+        if audio_capture.start():
+            client_system_audio[client_id] = audio_capture
+            input_name = 'system audio' if input_mode == 'system' else 'microphone'
+            logger.info(f"🎙️ {input_name.capitalize()} started: {client_id}")
+            emit('recording_status', {'is_recording': True, 'status': f'Recording {input_name}...'})
+        else:
+            input_name = 'system audio' if input_mode == 'system' else 'microphone'
+            logger.error(f"⚠️ Failed to start {input_name} for {client_id}")
+            emit('recording_status', {'is_recording': False, 'status': f'Failed to start {input_name}. Check server logs.'})
+    except Exception as e:
+        input_name = 'system audio' if input_mode == 'system' else 'microphone'
+        logger.error(f"Failed to start {input_name}: {e}")
+        emit('recording_status', {'is_recording': False, 'status': f'{input_name.capitalize()} error: {str(e)}'})
 
 @socketio.on('stop_recording')
 def handle_stop_recording(data=None):
@@ -601,37 +602,19 @@ def _process_audio_chunk(client_id, audio_to_process):
         _process_audio_chunk._debug_count[client_id] += 1
         logger.info(f"[Audio Debug {_process_audio_chunk._debug_count[client_id]}] Client {client_id}: level={audio_level:.6f}, dB={input_db:.2f}, samples={len(audio_to_process)}")
     
-    # Process through pipeline (VAD, noise reduction, STT)
-    if audio_level < MIN_AUDIO_LEVEL:
-        # Below threshold - send original audio for saving, but mark as silence
-        audio_bytes = (audio_to_process * 32768.0).astype(np.int16).tobytes()
-        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-        
-        # Debug: Log emission attempt
-        if not hasattr(_process_audio_chunk, '_emit_count'):
-            _process_audio_chunk._emit_count = {}
-        if client_id not in _process_audio_chunk._emit_count:
-            _process_audio_chunk._emit_count[client_id] = 0
-        _process_audio_chunk._emit_count[client_id] += 1
-        
-        if _process_audio_chunk._emit_count[client_id] <= 3:
-            logger.info(f"[Emit Debug {_process_audio_chunk._emit_count[client_id]}] Emitting processed_audio to {client_id[:8]}... (silence, {len(audio_b64)} bytes)")
-        
-        try:
-            socketio.emit('processed_audio', {
-                'audio': audio_b64,
-                'has_speech': False, 'speech_state': 'silence',
-                'audio_level_db': float(round(input_db, 2)), 'vad_probability': 0.0
-            }, room=client_id)
-        except Exception as e:
-            logger.error(f"Error emitting processed_audio: {e}")
-        return None
-    
+    # CRITICAL: Process ALL audio through pipeline (VAD, noise reduction, STT)
+    # Do NOT skip based on audio level - let VAD determine if it's speech
+    # This ensures both microphone and system audio modes work identically
     processed = pipeline.process_chunk(audio_to_process)
     input_db = 20 * np.log10(np.abs(audio_to_process).max() + 1e-10)
-    vad_prob = pipeline.vad.get_probability(audio_to_process)
-    is_speech = pipeline.vad.is_speech(audio_to_process)
-    speech_state = "speech" if pipeline.is_speaking else "silence"
+    # CRITICAL: Use per-chunk VAD result for has_speech (frontend needs this for history)
+    # But use pipeline.is_speaking for speech_state (aggregated state with chunk counting)
+    # This allows frontend to build history while respecting backend's chunk counting logic
+    is_speech = pipeline.last_chunk_is_speech  # Per-chunk VAD result for frontend history
+    speech_state = "speech" if pipeline.is_speaking else "silence"  # Aggregated state
+    # Get VAD probability from denoised audio for display purposes
+    audio_for_vad = processed if processed is not None else audio_to_process
+    vad_prob = pipeline.vad.get_probability(audio_for_vad) if audio_for_vad is not None else 0.0
     
     # Always send audio for saving (use processed if available, otherwise original)
     audio_to_save = processed if processed is not None else audio_to_process
@@ -662,9 +645,10 @@ def _process_audio_chunk(client_id, audio_to_process):
 @socketio.on('audio_chunk')
 def handle_audio_chunk(data):
     client_id = request.sid
-    # Skip browser audio if system audio is active (server handles it)
+    # Skip browser audio - both modes now use server-side capture
+    # This handler is kept for backward compatibility but should not be used
     if client_id in client_system_audio:
-        return
+        return  # Server-side capture is active
     if not client_recording_state.get(client_id, False):
         return
     
@@ -710,7 +694,7 @@ def handle_audio_chunk(data):
         else:
             input_db = 20 * np.log10(np.abs(audio_float).max() + 1e-10)
             emit('processed_audio', {
-                'audio': '', 'has_speech': False, 'speech_state': 'buffering',
+                'audio': '', 'has_speech': False, 'speech_state': 'silence',
                 'audio_level_db': float(round(input_db, 2)), 'vad_probability': 0.0
             })
     except Exception as e:

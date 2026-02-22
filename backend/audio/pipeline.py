@@ -43,6 +43,14 @@ class AudioPipeline:
         self.speech_pre_buffer = []  # Buffer audio chunks before STT starts to capture beginning
         self._stopping_stt = False
         self._stopping_chunks = 0
+        self._always_buffer = True  # Always buffer audio from recording start, not just when VAD detects speech
+        self.last_chunk_is_speech = False  # Store per-chunk VAD result for frontend display
+        # Track audio levels for noise detection
+        self.recent_audio_levels = []  # Store recent audio levels to detect constant noise
+        self.max_level_history = 20
+        self._constant_noise_detected = False  # Persistent flag for constant noise detection  # Track last 20 chunks (~600ms at 30ms chunks)
+        self.requires_silence_before_speech = False  # Disabled - was too strict and prevented real speech detection
+        self.silence_chunks_required = 0  # Not used when requires_silence_before_speech is False
     
     def _emit_event(self, event_type: str, data: Dict[str, Any]):
         if self.event_callback:
@@ -91,23 +99,105 @@ class AudioPipeline:
             return None
         
         denoised_audio = self.rnnoise.reduce_noise(audio)
-        is_speech = self.vad.is_speech(denoised_audio)
+        
+        # Check audio level - filter out very quiet audio to reduce false positives
+        audio_level = np.abs(denoised_audio).max()
+        # Use a moderate threshold - too low causes false positives, too high misses quiet speech
+        MIN_AUDIO_LEVEL_FOR_VAD = 0.02  # Require at least 2% amplitude for VAD processing
+        
+        # Track recent audio levels to detect constant background noise (only for extreme cases)
+        self.recent_audio_levels.append(audio_level)
+        if len(self.recent_audio_levels) > self.max_level_history:
+            self.recent_audio_levels.pop(0)
+        
+        # CRITICAL: Detect constant background noise at any level
+        # Speech has variation even when loud, constant noise is steady
+        # Key insight: Constant noise has very low variation (std < 0.02) regardless of level
+        # Once detected, persist the rejection until we get real silence
+        if len(self.recent_audio_levels) >= 10:
+            # Calculate variation (standard deviation) of recent levels
+            level_std = np.std(self.recent_audio_levels)
+            level_mean = np.mean(self.recent_audio_levels)
+            
+            # Check if constant noise pattern is present
+            is_constant_noise_now = False
+            if 0.15 <= level_mean <= 0.60 and level_std < 0.02:
+                is_constant_noise_now = True
+            elif level_mean > 0.60 and level_std < 0.01:
+                is_constant_noise_now = True
+            
+            # Set persistent flag if constant noise detected
+            if is_constant_noise_now:
+                if not self._constant_noise_detected:
+                    logger.warning(f"🔇 Detected constant noise: mean={level_mean:.3f} ({level_mean*100:.1f}%), std={level_std:.3f} - rejecting as non-speech")
+                self._constant_noise_detected = True
+            # Clear flag if we detect variation (speech) or real silence
+            elif self._constant_noise_detected:
+                # Clear constant noise flag if:
+                # 1. Real silence (very low levels)
+                # 2. Significant variation detected (std > 0.03) - indicates speech, not constant noise
+                # 3. Quiet varying audio (low mean with variation)
+                if audio_level < 0.01 or level_std > 0.03 or (level_mean < 0.05 and level_std > 0.01):
+                    logger.info(f"🔊 Constant noise cleared: mean={level_mean:.3f}, std={level_std:.3f} - variation detected (speech)")
+                    self._constant_noise_detected = False
+        
+        is_likely_constant_noise = self._constant_noise_detected
+        
+        # CRITICAL: Always buffer audio from recording start, not just when VAD detects speech
+        # This ensures we capture the first words even if VAD takes time to detect
+        if self._always_buffer and not self.is_speaking:
+            audio_16k = self._resample_to_stt_rate(denoised_audio)
+            self.speech_pre_buffer.append(audio_16k)
+            # Keep last ~3 seconds worth
+            max_pre_buffer_samples = int(16000 * 3.0)
+            total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
+            while total_samples > max_pre_buffer_samples and len(self.speech_pre_buffer) > 1:
+                removed = self.speech_pre_buffer.pop(0)
+                total_samples -= len(removed)
+        
+        # Only run VAD on audio that's loud enough (reduces false positives from background noise)
+        is_speech = False
+        
+        # CRITICAL: If constant noise was detected, persist the rejection and reset speech count
+        # This prevents constant noise from accumulating speech chunks and triggering STT
+        if is_likely_constant_noise:
+            is_speech = False
+            # Reset speech chunk count to prevent false triggers from accumulated chunks
+            self.speech_chunk_count = 0
+        elif audio_level >= MIN_AUDIO_LEVEL_FOR_VAD:
+            # Audio level is reasonable - run VAD (no upper limit, let VAD decide)
+            is_speech = self.vad.is_speech(denoised_audio)
+        else:
+            # Very quiet - treat as silence
+            is_speech = False
+            # Reset constant noise flag if we get real silence (very low levels)
+            if hasattr(self, '_noise_warning_logged') and audio_level < 0.01:
+                # Real silence detected - allow noise detection to reset
+                if len(self.recent_audio_levels) > 0:
+                    recent_mean = np.mean(self.recent_audio_levels[-5:])  # Check last 5 chunks
+                    if recent_mean < 0.01:
+                        # Clear noise flag after sustained silence
+                        if hasattr(self, '_noise_warning_logged'):
+                            delattr(self, '_noise_warning_logged')
+        
+        # CRITICAL: Require silence before accepting new speech (reduces false positives)
+        # This prevents constant noise from triggering speech detection
+        if is_speech and not self.is_speaking and self.requires_silence_before_speech:
+            # Check if we had enough silence chunks before this speech
+            if self.silence_chunk_count < self.silence_chunks_required:
+                # Not enough silence before speech - reject (likely constant noise)
+                is_speech = False
+        
+        # Store per-chunk VAD result for frontend (needed for history-based smoothing)
+        self.last_chunk_is_speech = is_speech
         
         if is_speech:
             self.speech_chunk_count += 1
             self.silence_chunk_count = 0
             
             if not self.is_speaking:
-                # Buffer audio chunks before STT starts to capture the beginning of speech
-                audio_16k = self._resample_to_stt_rate(denoised_audio)
-                self.speech_pre_buffer.append(audio_16k)
-                # Keep more chunks (last ~2 seconds worth) to ensure we capture the beginning
-                max_pre_buffer_samples = int(16000 * 2.0)  # 2 seconds at 16kHz (increased from 1.0)
-                total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
-                while total_samples > max_pre_buffer_samples and len(self.speech_pre_buffer) > 1:
-                    removed = self.speech_pre_buffer.pop(0)
-                    total_samples -= len(removed)
-                
+                # Audio is already being buffered above (always_buffer mode)
+                # Just check if we have enough speech chunks to start STT
                 if self.speech_chunk_count >= self.min_speech_chunks:
                     if self.stt_stop_time and (time.time() - self.stt_stop_time) < self.stt_cooldown_seconds:
                         return denoised_audio
@@ -128,27 +218,28 @@ class AudioPipeline:
                         self._emit_event("speech_start", {"timestamp": self.speech_start_time})
                         self.stt_start_failed = False
                         self.stt_stop_time = None  # Clear cooldown timer on successful start
-                        # Wait a brief moment for STT connection to be fully ready
-                        time.sleep(0.1)
+                        # REMOVED: No delay needed - STT is ready immediately
                         # Reset send counter
                         self._stt_send_count = 0
                         
                         # Send pre-buffered audio chunks first to capture the beginning
+                        # This includes audio from BEFORE VAD detected speech
                         if len(self.speech_pre_buffer) > 0:
                             pre_buffer_duration = sum(len(chunk) for chunk in self.speech_pre_buffer) / 16000
                             logger.info(f"Sending {len(self.speech_pre_buffer)} pre-buffered audio chunks ({pre_buffer_duration:.2f}s) to capture speech beginning")
-                            # Send all pre-buffered chunks
+                            # Send all pre-buffered chunks immediately (no delay)
                             for pre_audio in self.speech_pre_buffer:
                                 self.streaming_stt.send_audio(pre_audio)
                             self.speech_pre_buffer = []  # Clear after sending
-                            # Small delay to ensure pre-buffered chunks are processed
-                            time.sleep(0.05)
+                            # REMOVED: No delay needed - chunks are queued and processed asynchronously
                         
                         # CRITICAL: Also send the current chunk that triggered speech detection
                         # This ensures we don't lose the chunk that contains the beginning of speech
                         current_audio_16k = self._resample_to_stt_rate(denoised_audio)
                         self.streaming_stt.send_audio(current_audio_16k)
                         logger.debug(f"Sent current chunk after pre-buffer (len={len(current_audio_16k)})")
+                        # Stop always-buffering now that STT has started
+                        self._always_buffer = False
                     else:
                         logger.error("Failed to start STT stream")
                         if not self.stt_start_failed:
@@ -172,7 +263,17 @@ class AudioPipeline:
             self.silence_chunk_count += 1
             if not self.is_speaking:
                 self.speech_chunk_count = 0
-                self.speech_pre_buffer = []  # Clear pre-buffer if speech not confirmed
+                # Don't clear pre-buffer immediately - keep it for a bit in case speech starts soon
+                # Only clear if we have too much silence (more than 1 second)
+                if len(self.speech_pre_buffer) > 0:
+                    total_pre_buffer_duration = sum(len(chunk) for chunk in self.speech_pre_buffer) / 16000
+                    if total_pre_buffer_duration > 1.0:  # More than 1 second of buffered audio
+                        # Keep only the last 0.5 seconds
+                        max_keep_samples = int(16000 * 0.5)
+                        total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
+                        while total_samples > max_keep_samples and len(self.speech_pre_buffer) > 1:
+                            removed = self.speech_pre_buffer.pop(0)
+                            total_samples -= len(removed)
             
             if self.is_speaking:
                 if self.silence_chunk_count >= self.hangover_chunks:
@@ -233,3 +334,7 @@ class AudioPipeline:
         self.stt_stop_time = None
         self._stopping_stt = False
         self._stopping_chunks = 0
+        self._always_buffer = True  # Re-enable always-buffering for next recording
+        self.last_chunk_is_speech = False  # Reset per-chunk VAD result
+        self.recent_audio_levels = []  # Reset audio level history
+        self._constant_noise_detected = False  # Reset constant noise detection flag

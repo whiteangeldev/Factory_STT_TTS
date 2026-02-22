@@ -352,96 +352,15 @@ class STTApp {
                 if (micBtn) micBtn.classList.add('active');
             }
             
-            let stream;
-            if (this.inputMode === 'system') {
-                // System audio: Use server-side capture (no browser permissions needed)
-                console.log('Using server-side system audio capture');
-                this.log('Starting server-side system audio capture...', 'info');
-                
-                // No browser audio capture needed - server handles it
-                this.mediaStream = null;
-                this.isRecording = true;
-                this.isStopping = false;
-                this.audioChunks = [];
-                this.transcriptionBuffer = [];
-                // Don't reset transcriptionHistory - keep it for stats
-                // Don't reset transcriptionCount - count from DOM instead
-                this.currentInterimText = '';
-                this.lastTranscriptionTime = null;
-                this.recordingStartTime = Date.now() / 1000;
-                
-                // Reset counters for logging
-                this._processedAudioCount = 0;
-                this._silenceChunkCount = 0;
-                
-                console.log('🎙️ System audio mode: Ready to receive audio from server');
-                console.log('   Waiting for processed_audio events...');
-                
-                // Don't clear transcription area - keep previous transcriptions
-                // Notify backend to start server-side capture
-                if (this.socket && this.socket.connected) {
-                    this.socket.emit('start_recording', {
-                        input_mode: 'system',
-                        server_capture: true
-                    });
-                }
-                
-                // Update UI
-                const recordBtn = document.getElementById('recordBtn');
-                recordBtn.classList.add('recording');
-                document.getElementById('saveBtn').disabled = false;
-                
-                this.updateSystemStatus('listening', 'Listening (system audio)...');
-                this.log('System audio started - capturing from server (no browser permissions needed)', 'success');
-                return;  // Exit early - no browser audio setup needed
-            } else {
-                // Request microphone access
-                if (!navigator.mediaDevices.getUserMedia) {
-                    throw new Error('Microphone access is not available in this browser.');
-                }
-                
-                console.log('Requesting microphone access...');
-                this.log('Requesting microphone permission...', 'info');
-                
-                try {
-                    // First try with ideal constraints
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            channelCount: { ideal: 1 },
-                            sampleRate: { ideal: 16000 },
-                            echoCancellation: { ideal: true },
-                            noiseSuppression: { ideal: true },
-                            autoGainControl: { ideal: true }
-                        }
-                    });
-                } catch (err) {
-                    console.warn('Failed with ideal constraints, trying basic constraints:', err);
-                    // Fallback to basic constraints
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        audio: true
-                    });
-                }
-                
-                console.log('Microphone access granted');
-                this.log('Microphone access granted', 'success');
-            }
+            // Both system audio and microphone: Use server-side capture
+            const inputName = this.inputMode === 'system' ? 'system audio' : 'microphone';
+            console.log(`Using server-side ${inputName} capture`);
+            this.log(`Starting server-side ${inputName} capture...`, 'info');
             
-            // Get actual audio track settings
-            const audioTracks = stream.getAudioTracks();
-            if (audioTracks.length === 0) {
-                throw new Error('No audio track available. Please check your input source.');
-            }
-            
-            const audioTrack = audioTracks[0];
-            const settings = audioTrack.getSettings();
-            console.log('Audio track settings:', settings);
-            
-            const sourceType = this.inputMode === 'system' ? 'System Audio' : 'Microphone';
-            this.log(`${sourceType}: ${settings.sampleRate || 'unknown'} Hz, ${settings.channelCount || 'unknown'} channels`, 'info');
-            
-            this.mediaStream = stream;
+            // No browser audio capture needed - server handles it
+            this.mediaStream = null;
             this.isRecording = true;
-            this.isStopping = false;  // Reset stopping flag when starting
+            this.isStopping = false;
             this.audioChunks = [];
             this.transcriptionBuffer = [];
             // Don't reset transcriptionHistory - keep it for stats
@@ -450,56 +369,28 @@ class STTApp {
             this.lastTranscriptionTime = null;
             this.recordingStartTime = Date.now() / 1000;
             
+            // Reset counters for logging
+            this._processedAudioCount = 0;
+            this._silenceChunkCount = 0;
+            
+            // CRITICAL: Reset VAD state and history when starting new recording
+            // This prevents false positives from previous recording's history
+            this.vadHistory = [];
+            this.currentVadState = false;
+            this.currentVadDisplayState = false;
+            this._vadUiHoldUntil = 0;
+            this._speechEnded = false;
+            this._speechEndedCount = 0;
+            
+            console.log(`🎙️ ${inputName.charAt(0).toUpperCase() + inputName.slice(1)} mode: Ready to receive audio from server`);
+            console.log('   Waiting for processed_audio events...');
+            
             // Don't clear transcription area - keep previous transcriptions
-            // Setup audio processing using AudioWorkletNode (modern) or fallback to ScriptProcessor
-            const source = this.audioContext.createMediaStreamSource(stream);
-            
-            // Use ScriptProcessorNode (deprecated but widely supported)
-            // Buffer size must be a power of 2 between 256 and 16384
-            // 512 samples = 32ms at 16kHz
-            const bufferSize = 512;
-            
-            // Create processor node
-            this.processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
-            
-            this.processor.onaudioprocess = (e) => {
-                if (!this.isRecording) return;
-                
-                const inputData = e.inputBuffer.getChannelData(0);
-                
-                // Check if we actually have audio data
-                const maxLevel = Math.max(...Array.from(inputData).map(Math.abs));
-                const rms = Math.sqrt(Array.from(inputData).reduce((sum, val) => sum + val * val, 0) / inputData.length);
-                
-                // Log first few chunks for debugging
-                if (!this.processor._debugCount) {
-                    this.processor._debugCount = 0;
-                }
-                this.processor._debugCount++;
-                if (this.processor._debugCount <= 5) {
-                    console.log(`[Audio Debug ${this.processor._debugCount}] Samples: ${inputData.length}, SampleRate: ${this.audioContext.sampleRate}Hz, MaxLevel: ${maxLevel.toFixed(6)}, RMS: ${rms.toFixed(6)}`);
-                }
-                
-                if (maxLevel < 0.0001) {
-                    // Very quiet or silent - might be muted or no input
-                    if (this.processor._debugCount <= 10) {
-                        console.warn(`[Audio Debug ${this.processor._debugCount}] Audio level very low: ${maxLevel.toFixed(6)} - check microphone`);
-                    }
-                }
-                
-                // Send the raw audio data (will be resampled if needed)
-                this.processAudioChunk(inputData, this.audioContext.sampleRate);
-            };
-            
-            // Connect: source -> processor -> destination (to avoid audio feedback, connect to destination)
-            source.connect(this.processor);
-            this.processor.connect(this.audioContext.destination);
-            
-            // Notify backend that recording has started
+            // Notify backend to start server-side capture
             if (this.socket && this.socket.connected) {
                 this.socket.emit('start_recording', {
                     input_mode: this.inputMode,
-                    server_capture: false
+                    server_capture: true
                 });
             }
             
@@ -508,8 +399,9 @@ class STTApp {
             recordBtn.classList.add('recording');
             document.getElementById('saveBtn').disabled = false;
             
-            this.updateSystemStatus('listening', 'Listening...');
-            this.log('Recording started successfully', 'success');
+            const statusMessage = this.inputMode === 'system' ? 'Listening (system audio)...' : 'Listening (microphone)...';
+            this.updateSystemStatus('listening', statusMessage);
+            this.log(`${inputName.charAt(0).toUpperCase() + inputName.slice(1)} started - capturing from server`, 'success');
             
         } catch (error) {
             console.error('Error starting recording:', error);
@@ -557,41 +449,8 @@ class STTApp {
             this.socket.emit('stop_recording');
         }
         
-        // For microphone mode: disconnect processor and stop media stream
-        if (this.inputMode === 'microphone') {
-            // Disconnect processor immediately to stop audio capture
-            if (this.processor) {
-                try {
-                    this.processor.disconnect();
-                } catch (e) {
-                    console.warn('Error disconnecting processor:', e);
-                }
-                this.processor = null;
-            }
-            
-            // Stop media stream tracks
-            if (this.mediaStream) {
-                this.mediaStream.getTracks().forEach(track => {
-                    try {
-                        track.stop();
-                    } catch (e) {
-                        console.warn('Error stopping track:', e);
-                    }
-                });
-                this.mediaStream = null;
-            }
-            
-            // Close audio context (only for microphone mode)
-            if (this.audioContext) {
-                try {
-                    this.audioContext.close();
-                } catch (e) {
-                    console.warn('Error closing audio context:', e);
-                }
-                this.audioContext = null;
-            }
-        }
-        // For system audio mode: server handles stopping, just update UI
+        // Both modes use server-side capture, so no browser audio cleanup needed
+        // Server handles stopping the audio capture
         
         const recordBtn = document.getElementById('recordBtn');
         recordBtn.classList.remove('recording');
@@ -620,8 +479,9 @@ class STTApp {
     }
     
     processAudioChunk(audioData, sourceSampleRate = 16000) {
-        // Only process if recording and not stopping, and not in system audio mode
-        if (!this.isRecording || this.isStopping || this.inputMode === 'system') {
+        // Both modes now use server-side capture, so this function is no longer used
+        // Keeping for backward compatibility but it won't be called
+        if (!this.isRecording || this.isStopping) {
             return;
         }
         
@@ -889,8 +749,9 @@ class STTApp {
                     smoothedSpeech = (speechCount >= 2);  // Stay if 2+ chunks are speech
                 }
             } else {
-                // Currently in no-speech state - require moderate evidence to enter (2+ speech chunks)
-                smoothedSpeech = (speechCount >= 2);  // Enter speech if 2+ chunks are speech
+                // Currently in no-speech state - require stronger evidence to enter (4+ speech chunks)
+                // This reduces false positives from background noise
+                smoothedSpeech = (speechCount >= 4);  // Enter speech if 4+ out of 5 chunks are speech
             }
             
             // Update VAD detection state (core logic - unchanged)
@@ -930,11 +791,7 @@ class STTApp {
                     // No speech - hide green dot
                     if (vadDot) vadDot.classList.remove('active');
                     if (vadStatus) {
-                        if (data.speech_state === 'buffering') {
-                            vadStatus.textContent = 'Buffering...';
-                        } else {
-                            vadStatus.textContent = 'No Speech';
-                        }
+                        vadStatus.textContent = 'No Speech';
                     }
                 }
             }
@@ -944,11 +801,7 @@ class STTApp {
                 if (this.currentVadDisplayState) {
                     this.updateSystemStatus('speech_detected', 'Speech Detected');
                 } else {
-                    if (data.speech_state === 'buffering') {
-                        this.updateSystemStatus('listening', 'Buffering...');
-                    } else {
-                        this.updateSystemStatus('listening', 'Listening...');
-                    }
+                    this.updateSystemStatus('listening', 'Listening...');
                 }
             }
         }

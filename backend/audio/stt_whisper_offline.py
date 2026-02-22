@@ -253,49 +253,181 @@ class WhisperOfflineSTT:
             # Transcribe using Whisper with better settings
             logger.debug(f"Processing {len(audio_data)/16000:.2f}s of audio (final={final})")
             
-            # For final transcription, use better settings to capture complete text
-            transcribe_kwargs = {
-                "language": None,  # Auto-detect language
-                "task": "transcribe",
-                "fp16": False,  # Use fp32 for compatibility
-                "verbose": False,
-            }
+            # CRITICAL: Restrict to only English, Chinese, and Japanese
+            supported_languages = ["en", "zh", "ja"]
             
-            if final:
-                # For final transcription, balance accuracy and speed
-                transcribe_kwargs["condition_on_previous_text"] = True  # Use previous text for better continuity
-                transcribe_kwargs["initial_prompt"] = self.last_final_text if self.last_final_text else None
-                # Reduce beam_size from 5 to 3 for faster processing (still accurate)
-                transcribe_kwargs["beam_size"] = 3
-                # Reduce best_of from 5 to 3 for faster processing
-                transcribe_kwargs["best_of"] = 3
-                # Use temperature=0 for more deterministic results
-                transcribe_kwargs["temperature"] = 0
-                # Use compression_ratio_threshold to filter out repetitive text
-                transcribe_kwargs["compression_ratio_threshold"] = 2.4
-                # Use logprob_threshold to filter low-confidence transcriptions
-                transcribe_kwargs["logprob_threshold"] = -1.0
-                # Use no_speech_threshold to better detect speech vs silence
-                transcribe_kwargs["no_speech_threshold"] = 0.6
-                # Use word_timestamps for better word-level accuracy
-                transcribe_kwargs["word_timestamps"] = True
-                # Try fp16 for faster processing (if supported on GPU/MPS)
+            # For interim transcriptions, use English (fastest, interim is just for feedback)
+            # For final transcriptions, try all 3 and pick the best (more accurate)
+            if not final:
+                # Use English for interim transcriptions (fast and reliable)
                 try:
-                    import torch
-                    if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                        transcribe_kwargs["fp16"] = True  # Faster on GPU/MPS
-                except:
-                    pass  # Fall back to fp32
+                    transcribe_kwargs = {
+                        "language": "en",  # Use English for interim (fast)
+                        "task": "transcribe",
+                        "fp16": False,
+                        "verbose": False,
+                        "condition_on_previous_text": True,
+                        "initial_prompt": self.last_final_text if self.last_final_text else None,
+                    }
+                    result = self.model.transcribe(audio_data, **transcribe_kwargs)
+                    language = "en"  # Interim uses English, final will determine actual language
+                except Exception as e:
+                    logger.error(f"Interim transcription failed: {e}")
+                    return  # Skip this interim transcription
             else:
-                # For interim, use faster settings
-                transcribe_kwargs["condition_on_previous_text"] = True
-                transcribe_kwargs["initial_prompt"] = self.last_final_text if self.last_final_text else None
-            
-            result = self.model.transcribe(audio_data, **transcribe_kwargs)
+                # For final transcription: use Whisper's auto-detection first, then verify with scoring
+                # First, try transcribing with language=None to let Whisper auto-detect
+                detected_language = None
+                
+                try:
+                    # Try auto-detection by transcribing without specifying language
+                    # Whisper will detect the language automatically
+                    auto_result = self.model.transcribe(
+                        audio_data,
+                        language=None,  # Auto-detect
+                        task="transcribe",
+                        fp16=False,
+                        verbose=False,
+                        condition_on_previous_text=True,
+                        initial_prompt=self.last_final_text if self.last_final_text else None,
+                    )
+                    
+                    # Get detected language from result
+                    detected_language = auto_result.get("language", "en")
+                    logger.info(f"Whisper auto-detected language: '{detected_language}'")
+                    
+                    # Map to our supported languages
+                    language_map = {
+                        'zh': 'zh', 'chinese': 'zh',
+                        'en': 'en', 'english': 'en',
+                        'ja': 'ja', 'japanese': 'ja'
+                    }
+                    
+                    detected_language_lower = detected_language.lower() if detected_language else "en"
+                    if detected_language_lower in language_map:
+                        detected_language = language_map[detected_language_lower]
+                    elif detected_language not in supported_languages:
+                        detected_language = None  # Not supported, will try all languages
+                        logger.warning(f"Auto-detected language '{detected_language}' not in supported list")
+                except Exception as e:
+                    logger.warning(f"Auto-detection failed: {e}, will try all languages")
+                    detected_language = None
+                
+                # If auto-detection succeeded and language is supported, use it with better settings
+                if detected_language and detected_language in supported_languages:
+                    try:
+                        transcribe_kwargs = {
+                            "language": detected_language,
+                            "task": "transcribe",
+                            "fp16": False,
+                            "verbose": False,
+                            "condition_on_previous_text": True,
+                            "initial_prompt": self.last_final_text if self.last_final_text else None,
+                            "beam_size": 5,  # Increased for better accuracy
+                            "best_of": 5,
+                            "temperature": 0,
+                            "compression_ratio_threshold": 2.4,
+                            "logprob_threshold": -1.0,
+                            "no_speech_threshold": 0.6,
+                            "word_timestamps": True,
+                        }
+                        try:
+                            import torch
+                            if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                                transcribe_kwargs["fp16"] = True
+                        except:
+                            pass
+                        
+                        result = self.model.transcribe(audio_data, **transcribe_kwargs)
+                        language = detected_language
+                        logger.info(f"Transcribed with auto-detected language '{language}'")
+                    except Exception as e:
+                        logger.warning(f"Transcription with detected language '{detected_language}' failed: {e}, trying fallback")
+                        detected_language = None  # Fall through to fallback
+                
+                # Fallback: if auto-detection failed or detected unsupported language, try all 3 and pick best
+                if not detected_language or detected_language not in supported_languages:
+                    best_result = None
+                    best_language = "en"
+                    best_score = -float('inf')
+                    
+                    for lang in supported_languages:
+                        try:
+                            transcribe_kwargs = {
+                                "language": lang,
+                                "task": "transcribe",
+                                "fp16": False,
+                                "verbose": False,
+                                "condition_on_previous_text": True,
+                                "initial_prompt": self.last_final_text if self.last_final_text else None,
+                                "beam_size": 5,  # Increased for better accuracy
+                                "best_of": 5,
+                                "temperature": 0,
+                                "compression_ratio_threshold": 2.4,
+                                "logprob_threshold": -1.0,
+                                "no_speech_threshold": 0.6,
+                                "word_timestamps": True,
+                            }
+                            try:
+                                import torch
+                                if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                                    transcribe_kwargs["fp16"] = True
+                            except:
+                                pass
+                            
+                            test_result = self.model.transcribe(audio_data, **transcribe_kwargs)
+                            test_text = test_result.get("text", "").strip()
+                            test_segments = test_result.get("segments", [])
+                            
+                            if not test_text:
+                                continue
+                            
+                            # Improved scoring: prioritize avg_logprob (confidence) over text length
+                            # Higher logprob = better match for that language
+                            if test_segments:
+                                avg_logprob = np.mean([s.get("avg_logprob", -1.0) for s in test_segments])
+                                # Use logprob as primary score (it's already a good indicator)
+                                # Add small bonus for longer text only if logprob is similar
+                                score = avg_logprob + (len(test_text) * 0.0001)  # Reduced text length weight
+                            else:
+                                score = -1.0  # No segments = low score
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_result = test_result
+                                best_language = lang
+                        except Exception as e:
+                            logger.warning(f"Error transcribing with language {lang}: {e}")
+                            continue
+                    
+                    # Use the best result
+                    if best_result:
+                        result = best_result
+                        language = best_language
+                        logger.info(f"Selected language '{language}' (score: {best_score:.3f})")
+                    else:
+                        # Final fallback: use English
+                        logger.warning("All language attempts failed, using English as fallback")
+                        language = "en"
+                        transcribe_kwargs = {
+                            "language": "en",
+                            "task": "transcribe",
+                            "fp16": False,
+                            "verbose": False,
+                            "condition_on_previous_text": True,
+                            "initial_prompt": self.last_final_text if self.last_final_text else None,
+                            "beam_size": 3,
+                            "best_of": 3,
+                            "temperature": 0,
+                        }
+                        result = self.model.transcribe(audio_data, **transcribe_kwargs)
             
             text = result.get("text", "").strip()
-            language = result.get("language", "en")
             segments = result.get("segments", [])
+            
+            # Final verification: ensure language is one of our 3
+            if language not in supported_languages:
+                language = "en"
             
             # Filter out very short or low-confidence transcriptions
             if len(text) < 2:  # Too short, likely noise
@@ -325,15 +457,8 @@ class WhisperOfflineSTT:
                         logger.debug(f"Skipping low-confidence interim transcription: {confidence:.2f}")
                         return
                 
-                # Map language code to standard format
-                lang_map = {
-                    "en": "en",
-                    "zh": "zh",
-                    "ja": "ja",
-                    "japanese": "ja",
-                    "chinese": "zh"
-                }
-                detected_lang = lang_map.get(language.lower(), language.lower())
+                # Language is already normalized to en/zh/ja above
+                detected_lang = language
                 
                 # Track latency
                 if self.first_transcription_time is None and self.first_audio_time:
