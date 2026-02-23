@@ -59,7 +59,7 @@ class AudioPipeline:
             except Exception as e:
                 logger.error(f"Error in event callback: {e}")
     
-    def _on_transcript(self, text: str, is_final: bool, language: str, confidence: float):
+    def _on_transcript(self, text: str, is_final: bool, language: str, confidence: float, **kwargs):
         if not text or not text.strip():
             logger.debug(f"[Pipeline STT] Empty transcription received (is_final={is_final})")
             return
@@ -68,15 +68,24 @@ class AudioPipeline:
         status = "FINAL" if is_final else "INTERIM"
         logger.info(f"[Pipeline STT {status}] '{text[:80]}...'")
         
+        # Get incremental update if available (for streaming effect)
+        incremental_text = kwargs.get('incremental_update', None)
+        
         # Emit to frontend with timestamp for latency tracking
         event_type = "transcription" if is_final else "transcription_interim"
-        self._emit_event(event_type, {
+        event_data = {
             "text": text.strip(),
             "language": language or "en",
             "confidence": float(confidence) if confidence else (1.0 if is_final else 0.8),
             "timestamp": time.time(),
             "is_final": is_final
-        })
+        }
+        
+        # Add incremental text if available (for streaming effect)
+        if incremental_text:
+            event_data["incremental_text"] = incremental_text.strip()
+        
+        self._emit_event(event_type, event_data)
     
     def _resample_to_stt_rate(self, audio: np.ndarray) -> np.ndarray:
         """Resample audio to STT target rate (16kHz for Whisper)"""
@@ -149,7 +158,7 @@ class AudioPipeline:
             audio_16k = self._resample_to_stt_rate(denoised_audio)
             self.speech_pre_buffer.append(audio_16k)
             # Keep last ~3 seconds worth
-            max_pre_buffer_samples = int(16000 * 3.0)
+            max_pre_buffer_samples = int(16000 * 5.0)  # Increased to 5 seconds to capture more beginning
             total_samples = sum(len(chunk) for chunk in self.speech_pre_buffer)
             while total_samples > max_pre_buffer_samples and len(self.speech_pre_buffer) > 1:
                 removed = self.speech_pre_buffer.pop(0)

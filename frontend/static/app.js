@@ -914,6 +914,7 @@ class STTApp {
     
     handleInterimTranscription(data) {
         const text = data.text || '';
+        const incrementalText = data.incremental_text || null;
         if (!text) return;
         
         this.currentInterimText = text;
@@ -925,10 +926,16 @@ class STTApp {
             emptyState.remove();
         }
         
-        // Remove previous interim entry if exists
-        const existingInterim = area.querySelector('.transcription-entry.interim');
-        if (existingInterim) {
-            existingInterim.remove();
+        // Get or create interim entry
+        let existingInterim = area.querySelector('.transcription-entry.interim');
+        let isNewEntry = false;
+        
+        if (!existingInterim) {
+            // Create new interim entry
+            existingInterim = document.createElement('div');
+            existingInterim.className = 'transcription-entry interim';
+            area.appendChild(existingInterim);
+            isNewEntry = true;
         }
         
         // Calculate latency if this is first interim
@@ -940,19 +947,44 @@ class STTApp {
             latencyInfo = ` <span class="latency-badge first">${latency}ms</span>`;
         }
         
-        // Add new interim entry with better visual feedback
-        const item = document.createElement('div');
-        item.className = 'transcription-entry interim';
+        // Update interim entry with streaming effect
+        if (incrementalText && !isNewEntry) {
+            // Streaming mode: append only new words
+            const textElement = existingInterim.querySelector('.transcription-text');
+            if (textElement) {
+                // Append new words with smooth animation
+                const newWordsSpan = document.createElement('span');
+                newWordsSpan.className = 'new-words';
+                newWordsSpan.textContent = incrementalText;
+                textElement.appendChild(document.createTextNode(' '));
+                textElement.appendChild(newWordsSpan);
+                
+                // Remove the 'new-words' class after a moment for smooth transition
+                setTimeout(() => {
+                    newWordsSpan.classList.remove('new-words');
+                    newWordsSpan.classList.add('normal-words');
+                }, 500);
+            } else {
+                // Fallback: update full text
+                existingInterim.innerHTML = `
+                    <div class="transcription-text">${this.escapeHtml(text)}</div>
+                    <div class="transcription-meta">
+                        <span class="lang-badge">PROCESSING</span>
+                        ${latencyInfo}
+                    </div>
+                `;
+            }
+        } else {
+            // First update or no incremental text: show full text
+            existingInterim.innerHTML = `
+                <div class="transcription-text">${this.escapeHtml(text)}</div>
+                <div class="transcription-meta">
+                    <span class="lang-badge">PROCESSING</span>
+                    ${latencyInfo}
+                </div>
+            `;
+        }
         
-        item.innerHTML = `
-            <div class="transcription-text">${this.escapeHtml(text)}</div>
-            <div class="transcription-meta">
-                <span class="lang-badge">PROCESSING</span>
-                ${latencyInfo}
-            </div>
-        `;
-        
-        area.appendChild(item);
         this.scrollToBottom(area);
     }
     
