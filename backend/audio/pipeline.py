@@ -19,7 +19,7 @@ class AudioPipeline:
         self.vad = VAD(config.VAD_AGGRESSIVENESS, config.VAD_FRAME_MS, config.SAMPLE_RATE)
         self.rnnoise = RNNoise(sample_rate=config.SAMPLE_RATE)
         self.streaming_stt = WhisperOfflineSTT(
-            model="small",  # Whisper model: "tiny", "base", "small", "medium", "large" (small for better accuracy)
+            model=config.WHISPER_MODEL,  # Whisper model: "tiny", "base", "small", "medium", "large"
             sample_rate=16000,  # Whisper uses 16kHz
             on_transcript=self._on_transcript
         )

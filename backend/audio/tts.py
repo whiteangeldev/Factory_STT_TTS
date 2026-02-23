@@ -25,11 +25,18 @@ except ImportError:
 
 try:
     import torch
-    from transformers import AutoProcessor, VitsModel
     _HAS_TORCH = True
 except ImportError:
     _HAS_TORCH = False
     torch = None
+
+try:
+    from transformers import AutoProcessor, VitsModel
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+    AutoProcessor = None
+    VitsModel = None
 
 # Try to import MeloTTS for Chinese and Japanese
 _HAS_MELOTTS = False
@@ -713,15 +720,18 @@ def _synthesize_melotts(
     if sys.platform == "darwin" and device != "cpu":
         logger.warning(f"Overriding device '{device}' to 'cpu' on macOS to avoid MPS issues")
         device = "cpu"
+
+    # MeloTTS accepts "cuda" but not all builds accept "cuda:N" style IDs.
+    melotts_device = "cuda" if isinstance(device, str) and device.startswith("cuda") else device
     
     # Initialize or get cached model
-    cache_key = f"{language}_{device}"
+    cache_key = f"{language}_{melotts_device}"
     if cache_key not in _melotts_cache:
-        logger.info(f"Initializing MeloTTS model for language: {language}, device: {device}")
+        logger.info(f"Initializing MeloTTS model for language: {language}, device: {melotts_device}")
         try:
-            model = _TTS_CLASS(language=language, device=device)
+            model = _TTS_CLASS(language=language, device=melotts_device)
             _melotts_cache[cache_key] = model
-            logger.info(f"✓ MeloTTS model initialized and cached ({language}, {device})")
+            logger.info(f"✓ MeloTTS model initialized and cached ({language}, {melotts_device})")
         except Exception as e:
             logger.error(f"Failed to initialize MeloTTS model: {e}")
             raise RuntimeError(
@@ -734,7 +744,7 @@ def _synthesize_melotts(
                 f"{'  python -m unidic download' if language == 'JP' else ''}"
             ) from e
     else:
-        logger.debug(f"Using cached MeloTTS model ({language}, {device})")
+        logger.debug(f"Using cached MeloTTS model ({language}, {melotts_device})")
     
     model = _melotts_cache[cache_key]
     
@@ -1160,317 +1170,7 @@ def synthesize_speech(
                     ) from e
             raise
     
-    # Legacy Chinese TTS code (kept for reference, but should not be reached)
-    if False and language_lower in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
-        if not _HAS_MELOTTS:
-            raise RuntimeError(
-                "MeloTTS is not installed. Install with:\n"
-                "  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                "  cd MeloTTS\n"
-                "  pip install -e .\n"
-                "\nOr via pip:\n"
-                "  pip install melotts"
-            )
-        
-        # Patch for macOS before initializing
-        if sys.platform == "darwin":
-            _patch_melotts_for_cpu()
-        
-        # Get device
-        device = _get_device(device_preference)
-        if sys.platform == "darwin" and device != "cpu":
-            logger.warning(f"Overriding device '{device}' to 'cpu' on macOS to avoid MPS issues")
-            device = "cpu"
-        
-        # Initialize or get cached model
-        cache_key = f"ZH_{device}"
-        
-        if cache_key not in _melotts_cache:
-            logger.info(f"Initializing MeloTTS model for language: ZH, device: {device}")
-            try:
-                model = _TTS_CLASS(language='ZH', device=device)
-                _melotts_cache[cache_key] = model
-                logger.info(f"✓ MeloTTS model initialized and cached (ZH, {device})")
-            except Exception as e:
-                logger.error(f"Failed to initialize MeloTTS model: {e}")
-                raise RuntimeError(
-                    f"Failed to initialize MeloTTS for Chinese. "
-                    f"Error: {e}\n\n"
-                    f"Installation:\n"
-                    f"  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                    f"  cd MeloTTS\n"
-                    f"  pip install -e ."
-                ) from e
-        else:
-            logger.debug(f"Using cached MeloTTS model (ZH, {device})")
-        
-        model = _melotts_cache[cache_key]
-        
-        # Get speaker ID (required for quality synthesis) - matching test_melotts_chinese.py
-        speaker_id = None
-        speaker_name = None
-        try:
-            speaker_ids = model.hps.data.spk2id
-            logger.info(f"Available speakers: {list(speaker_ids.keys())}")
-            
-            # Try to find a Chinese speaker
-            if 'ZH' in speaker_ids:
-                speaker_id = speaker_ids['ZH']
-                speaker_name = 'ZH'
-            elif 'Chinese' in speaker_ids:
-                speaker_id = speaker_ids['Chinese']
-                speaker_name = 'Chinese'
-            elif 'CN' in speaker_ids:
-                speaker_id = speaker_ids['CN']
-                speaker_name = 'CN'
-            else:
-                # Use first available speaker
-                speaker_name = list(speaker_ids.keys())[0]
-                speaker_id = speaker_ids[speaker_name]
-            
-            logger.info(f"Using speaker: {speaker_name} (ID: {speaker_id}) for Chinese")
-        except Exception as e:
-            logger.error(f"Could not get speaker IDs: {e}")
-            # Try to get speaker IDs from model directly as fallback
-            try:
-                if hasattr(model, 'hps') and hasattr(model.hps, 'data') and hasattr(model.hps.data, 'spk2id'):
-                    speaker_ids = model.hps.data.spk2id
-                    logger.info(f"Fallback: Available speakers: {list(speaker_ids.keys())}")
-                    speaker_name = list(speaker_ids.keys())[0]
-                    speaker_id = speaker_ids[speaker_name]
-                    logger.info(f"Fallback: Using first available speaker: {speaker_name} (ID: {speaker_id})")
-                else:
-                    raise ValueError("Cannot access speaker IDs from model")
-            except Exception as e2:
-                logger.error(f"All fallbacks failed, using speaker_id=0: {e2}")
-                speaker_id = 0  # Last resort default
-                speaker_name = "default"
-        
-        # Synthesize speech - process sentence by sentence (matching test_melotts_chinese.py)
-        try:
-            # Split text into sentences for processing (preserve segmentation for long context)
-            # Split by Chinese punctuation marks, but keep punctuation with the sentence
-            # Use lookahead to split on punctuation but keep it
-            sentences = re.split(r'([。！？；])', text)
-            # Recombine punctuation with previous sentence
-            text_segments = []
-            for i in range(0, len(sentences), 2):
-                if i + 1 < len(sentences):
-                    segment = sentences[i] + sentences[i + 1]
-                else:
-                    segment = sentences[i]
-                segment = segment.strip()
-                # Only add non-empty segments with actual content (more than just punctuation)
-                if segment and len(segment.strip('。！？；，、：')) > 0:
-                    text_segments.append(segment)
-            if not text_segments:
-                text_segments = [text.strip()] if text.strip() else []
-            
-            logger.debug(f"Chinese text split into {len(text_segments)} sentence segments for processing")
-            
-            # Ensure speed is valid (MeloTTS expects speed > 0)
-            if speed <= 0:
-                speed = 1.0
-            speed = max(0.5, min(2.0, speed))  # Clamp between 0.5x and 2.0x
-            # Apply Chinese TTS speed adjustment for more natural, human-like speech
-            # 0.75x provides better clarity and natural rhythm (not too slow, not too fast)
-            speed = speed * 0.75
-            
-            # Process each sentence one by one (matching test script approach)
-            import tempfile
-            audio_segments = []
-            sample_rate = None
-            
-            for idx, sentence in enumerate(text_segments):
-                if not sentence.strip():
-                    continue
-                
-                logger.debug(f"Processing sentence {idx + 1}/{len(text_segments)}: '{sentence[:30]}...'")
-                
-                # Use temporary file like test script does
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    # Synthesize to file exactly like test script (matching test_melotts_chinese.py line 293-298)
-                    model.tts_to_file(
-                        sentence,
-                        speaker_id,
-                        tmp_path,
-                        speed=speed
-                    )
-                    
-                    # Read the generated audio file
-                    seg_audio, seg_sr = sf.read(tmp_path, dtype='float32')
-                    if sample_rate is None:
-                        sample_rate = int(seg_sr)
-                    
-                    # Convert to mono if stereo
-                    if len(seg_audio.shape) > 1:
-                        seg_audio = np.mean(seg_audio, axis=1)
-                    
-                    # Ensure float32
-                    seg_audio = seg_audio.astype(np.float32)
-                    
-                    # Minimal normalization - only if values are clearly out of range
-                    max_val = np.abs(seg_audio).max()
-                    if max_val > 1.0:
-                        seg_audio = seg_audio / max_val
-                    elif max_val > 32767:
-                        seg_audio = seg_audio / 32768.0
-                    
-                    audio_segments.append(seg_audio)
-                    
-                    # Add natural pauses between sentences (human-like speech patterns)
-                    # Vary pause duration: longer after periods, shorter after commas
-                    if idx < len(text_segments) - 1:
-                        # Check if current sentence ends with period/full stop (longer pause)
-                        current_sentence = text_segments[idx]
-                        
-                        # Determine pause duration based on punctuation
-                        if current_sentence.rstrip().endswith(('。', '！', '？')):
-                            # Longer pause after sentence-ending punctuation (0.3-0.5 seconds)
-                            pause_duration = 0.4 + (idx % 3) * 0.05  # Slight variation: 0.4-0.5s
-                        elif current_sentence.rstrip().endswith(('，', '、', '：', '；')):
-                            # Medium pause after commas/semicolons (0.15-0.25 seconds)
-                            pause_duration = 0.2 + (idx % 2) * 0.05  # Variation: 0.2-0.25s
-                        else:
-                            # Default pause between segments (0.2-0.3 seconds)
-                            pause_duration = 0.25 + (idx % 2) * 0.05  # Variation: 0.25-0.3s
-                        
-                        pause = np.zeros(int(sample_rate * pause_duration), dtype=np.float32)
-                        # Add a very subtle fade-in/fade-out to pauses for more natural sound
-                        fade_samples = min(100, len(pause) // 10)
-                        if fade_samples > 0:
-                            fade_curve = np.linspace(0, 1, fade_samples)
-                            pause[:fade_samples] *= fade_curve
-                            pause[-fade_samples:] *= fade_curve[::-1]
-                        audio_segments.append(pause)
-                        
-                finally:
-                    # Clean up temp file
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-            
-            # Concatenate all sentence audio segments
-            if audio_segments:
-                audio_array = np.concatenate(audio_segments)
-            else:
-                raise RuntimeError("No audio segments generated")
-            
-            # Convert to bytes (WAV format)
-            output_buffer = io.BytesIO()
-            try:
-                sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), samplerate=sample_rate, format='WAV')
-                audio_bytes = output_buffer.getvalue()
-                logger.info(f"✓ MeloTTS synthesis successful ({len(audio_bytes)} bytes, {sample_rate} Hz, {len(text_segments)} sentences)")
-                if original_text != text:
-                    logger.info(f"Chinese TTS input normalized: '{original_text[:40]}...' -> '{text[:40]}...'")
-                return audio_bytes, sample_rate
-            finally:
-                output_buffer.close()
-                
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"MeloTTS synthesis error: {e}", exc_info=True)
-            
-            # Check if it's an NLTK resource error (for mixed Chinese-English text)
-            if "averaged_perceptron_tagger_eng" in error_msg or ("NLTK" in error_msg and "not found" in error_msg):
-                # Try to automatically download the NLTK resource
-                try:
-                    logger.info("Attempting to automatically download NLTK resource 'averaged_perceptron_tagger_eng'...")
-                    import nltk
-                    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
-                    logger.info("✓ NLTK resource downloaded successfully. Retrying entire synthesis...")
-                    
-                    # Retry the entire synthesis from the beginning
-                    import tempfile
-                    retry_audio_segments = []
-                    retry_sample_rate = None
-                    
-                    for idx, sentence in enumerate(text_segments):
-                        if not sentence.strip():
-                            continue
-                        
-                        logger.debug(f"Retrying sentence {idx + 1}/{len(text_segments)}: '{sentence[:30]}...'")
-                        
-                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                            tmp_path = tmp_file.name
-                        
-                        try:
-                            model.tts_to_file(
-                                sentence,
-                                speaker_id,
-                                tmp_path,
-                                speed=speed
-                            )
-                            
-                            seg_audio, seg_sr = sf.read(tmp_path, dtype='float32')
-                            if retry_sample_rate is None:
-                                retry_sample_rate = int(seg_sr)
-                            
-                            if len(seg_audio.shape) > 1:
-                                seg_audio = np.mean(seg_audio, axis=1)
-                            
-                            seg_audio = seg_audio.astype(np.float32)
-                            
-                            max_val = np.abs(seg_audio).max()
-                            if max_val > 1.0:
-                                seg_audio = seg_audio / max_val
-                            elif max_val > 32767:
-                                seg_audio = seg_audio / 32768.0
-                            
-                            retry_audio_segments.append(seg_audio)
-                            
-                            if idx < len(text_segments) - 1:
-                                pause = np.zeros(int(retry_sample_rate * 0.1), dtype=np.float32)
-                                retry_audio_segments.append(pause)
-                                
-                        finally:
-                            try:
-                                os.unlink(tmp_path)
-                            except Exception:
-                                pass
-                    
-                    # Concatenate and return
-                    if retry_audio_segments:
-                        audio_array = np.concatenate(retry_audio_segments)
-                        output_buffer = io.BytesIO()
-                        try:
-                            sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), samplerate=retry_sample_rate, format='WAV')
-                            audio_bytes = output_buffer.getvalue()
-                            logger.info(f"✓ MeloTTS synthesis successful after NLTK download ({len(audio_bytes)} bytes, {retry_sample_rate} Hz)")
-                            return audio_bytes, retry_sample_rate
-                        finally:
-                            output_buffer.close()
-                    else:
-                        raise RuntimeError("No audio segments generated after NLTK download and retry")
-                        
-                except Exception as nltk_error:
-                    logger.error(f"Failed to automatically download/use NLTK resource: {nltk_error}")
-                    raise RuntimeError(
-                        f"MeloTTS requires NLTK resources for processing mixed Chinese-English text.\n\n"
-                        f"INSTALLATION:\n"
-                        f"1. Install NLTK (if not already installed):\n"
-                        f"   pip install nltk\n\n"
-                        f"2. Download the required NLTK resource:\n"
-                        f"   python -c \"import nltk; nltk.download('averaged_perceptron_tagger_eng')\"\n\n"
-                        f"   OR download all NLTK data:\n"
-                        f"   python -c \"import nltk; nltk.download('all')\"\n\n"
-                        f"3. Restart the server\n\n"
-                        f"This is required when Chinese text contains English words (like 'GDP').\n"
-                        f"Original error: {error_msg[:200]}"
-                    ) from e
-            
-            raise RuntimeError(
-                f"MeloTTS synthesis failed. Error: {error_msg[:500]}\n\n"
-                f"Installation:\n"
-                f"  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                f"  cd MeloTTS\n"
-                f"  pip install -e ."
-            ) from e
+    # Chinese synthesis path is implemented via _synthesize_melotts() above.
     
     # For Japanese: Use MeloTTS
     if language_lower in ["ja", "jpn", "japanese"]:
@@ -1691,7 +1391,7 @@ def synthesize_speech(
     model_id = LANGUAGE_MODEL_MAP.get(language_lower)
     
     # If MMS-TTS model exists for this language, use it (fallback only, English should use PyKokoro above)
-    if model_id is not None and _HAS_TORCH:
+    if model_id is not None and _HAS_TORCH and _HAS_TRANSFORMERS:
         try:
             logger.info(f"Using MMS-TTS model for language: {language} (offline-capable)")
             
@@ -1821,7 +1521,7 @@ def synthesize_speech(
     if _HAS_MELOTTS:
         supported.append("zh/chinese (MeloTTS - offline-capable)")
         supported.append("ja/japanese (MeloTTS - offline-capable)")
-    elif _HAS_TORCH:
+    elif _HAS_TORCH and _HAS_TRANSFORMERS:
         # Fallback to MMS-TTS if PyKokoro not available
         supported.append("en/english (MMS-TTS - offline-capable, deprecated)")
     

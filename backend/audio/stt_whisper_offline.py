@@ -18,7 +18,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class WhisperOfflineSTT:
-    def __init__(self, model="base", sample_rate=16000, on_transcript: Optional[Callable] = None):
+    def __init__(self, model="small", sample_rate=16000, on_transcript: Optional[Callable] = None):
         """
         Initialize offline Whisper STT.
         

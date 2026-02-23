@@ -1,6 +1,10 @@
 """Flask-SocketIO server for real-time STT/TTS"""
 import eventlet
 eventlet.monkey_patch()
+try:
+    from eventlet import tpool as eventlet_tpool
+except Exception:
+    eventlet_tpool = None
 
 import base64
 import logging
@@ -165,7 +169,15 @@ app = Flask(__name__, static_folder='../frontend/static', template_folder='../fr
 app.config['SECRET_KEY'] = 'factory-stt-tts-secret-key'
 CORS(app)
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    logger=False,
+    engineio_logger=False,
+    ping_interval=25,
+    ping_timeout=120,
+)
 
 config = AudioConfig()
 connected_clients = set()
@@ -310,12 +322,24 @@ def _stream_tts_segments(
 
     try:
         for idx, segment_text in enumerate(safe_segments):
-            audio_bytes, sample_rate = synthesize_speech(
-                text=segment_text,
-                language=detected_lang,
-                speed=speed,
-                device_preference="auto"
-            )
+            # Offload heavy synthesis/model warmup to a native thread so
+            # eventlet heartbeat traffic can continue while TTS is running.
+            if eventlet_tpool is not None:
+                audio_bytes, sample_rate = eventlet_tpool.execute(
+                    synthesize_speech,
+                    segment_text,
+                    detected_lang,
+                    speed,
+                    "auto",
+                )
+            else:
+                # Fallback for environments where eventlet.tpool is unavailable.
+                audio_bytes, sample_rate = synthesize_speech(
+                    text=segment_text,
+                    language=detected_lang,
+                    speed=speed,
+                    device_preference="auto",
+                )
             audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
             total_bytes += len(audio_bytes)
 
