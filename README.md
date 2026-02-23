@@ -82,6 +82,36 @@ cd ..
 
 > **💡 Tip:** You only need to install the TTS engines for languages you plan to use. STT works without any TTS setup.
 
+### GPU Acceleration (NVIDIA, Optional but Recommended)
+
+If your PC has an NVIDIA GPU and you want faster TTS/STT:
+
+```bash
+# Activate venv first
+.venv\Scripts\activate      # Windows
+# source .venv/bin/activate # Mac/Linux
+
+# Switch runtime variants (safe to run even if not present)
+pip uninstall -y onnxruntime onnxruntime-gpu torch torchvision torchaudio
+
+# Install CUDA-enabled PyTorch wheels (example: CUDA 12.4)
+pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+
+# Install ONNX Runtime GPU provider (required by PyKokoro GPU path)
+pip install onnxruntime-gpu
+```
+
+Verify GPU availability:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+Expected:
+- `torch.cuda.is_available()` is `True`
+- ONNX providers include `CUDAExecutionProvider`
+
 ### Step 3: Run the Server
 
 ```bash

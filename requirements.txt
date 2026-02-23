@@ -19,10 +19,14 @@ audiolab
 # TTS dependencies (optional - install if you want to use TTS feature)
 # All TTS engines are offline-capable after initial model download
 # For English TTS (PyKokoro-82M - offline-capable, replaces MMS-TTS):
+# Supports CPU and GPU execution depending on the installed runtime variant.
+# For NVIDIA GPU acceleration, use CUDA-enabled torch and onnxruntime-gpu (see README GPU section).
 torch>=2.0.0
 transformers>=4.30.0
 datasets>=2.0.0
 soundfile>=0.12.0
+onnxruntime-gpu; platform_system != "Darwin"  # Prefer GPU ORT on Windows/Linux
+onnxruntime; platform_system == "Darwin"  # CPU/Metal-compatible fallback for macOS
 
 # For Chinese TTS (PyKokoro - offline-capable, faster than Piper):
 # Uses same dependencies as Japanese (pykokoro, spacy)

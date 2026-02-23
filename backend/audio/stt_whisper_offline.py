@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import re
+import subprocess
 from typing import Optional, Callable
 
 # Try to import Whisper
@@ -58,20 +59,76 @@ class WhisperOfflineSTT:
         self.last_full_text = ""  # Track last full text to detect what's new
         self.last_final_text = ""  # Track last final text
         self.detected_language_interim = None  # Cache detected language for interim
+        self.compute_device = "cpu"
+        self.use_fp16 = False
         
         # Compatibility property for pipeline
         self.api_key = "offline"  # Non-None value to indicate availability
         
+        # Select compute backend once and reuse it across all transcribe calls.
+        self._configure_inference_device()
+        
         # Load model in background thread to avoid blocking
         self._load_model()
+
+    def _nvidia_gpu_present(self) -> bool:
+        """Best-effort check for an NVIDIA GPU on Windows/Linux."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            return result.returncode == 0 and "GPU" in (result.stdout or "")
+        except Exception:
+            return False
+
+    def _configure_inference_device(self):
+        """Choose the fastest available inference device."""
+        try:
+            import torch
+        except Exception:
+            self.compute_device = "cpu"
+            self.use_fp16 = False
+            logger.warning("PyTorch unavailable, Whisper STT will run on CPU.")
+            return
+
+        if torch.cuda.is_available():
+            self.compute_device = "cuda"
+            self.use_fp16 = True
+            try:
+                torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
+            logger.info("Whisper STT configured for NVIDIA GPU (CUDA + fp16).")
+            return
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.compute_device = "mps"
+            self.use_fp16 = False
+            logger.info("Whisper STT configured for Apple Metal (MPS).")
+            return
+
+        self.compute_device = "cpu"
+        self.use_fp16 = False
+        if self._nvidia_gpu_present():
+            logger.warning(
+                "NVIDIA GPU detected, but PyTorch CUDA is unavailable. "
+                "Install a CUDA-enabled torch build to avoid CPU-only STT."
+            )
+        logger.info("Whisper STT configured for CPU.")
     
     def _load_model(self):
         """Load Whisper model (can be slow, so do it in background)"""
         def load():
             try:
-                logger.info(f"Loading Whisper model: {self.model_name} (this may take a moment...)")
-                self.model = whisper.load_model(self.model_name)
-                logger.info(f"Whisper model {self.model_name} loaded successfully")
+                logger.info(
+                    f"Loading Whisper model: {self.model_name} on {self.compute_device} (this may take a moment...)"
+                )
+                self.model = whisper.load_model(self.model_name, device=self.compute_device)
+                logger.info(f"Whisper model {self.model_name} loaded successfully on {self.compute_device}")
             except Exception as e:
                 logger.error(f"Failed to load Whisper model: {e}")
                 self.is_available = False
@@ -520,7 +577,7 @@ class WhisperOfflineSTT:
                             detection_audio,
                             language=None,  # Auto-detect
                             task="transcribe",
-                            fp16=False,
+                            fp16=self.use_fp16,
                             verbose=False,
                             beam_size=1,
                             best_of=1,
@@ -546,20 +603,14 @@ class WhisperOfflineSTT:
                     transcribe_kwargs = {
                         "language": interim_lang,
                         "task": "transcribe",
-                        "fp16": False,
+                        "fp16": self.use_fp16,
                         "verbose": False,
                         "condition_on_previous_text": True,
                         "initial_prompt": self.last_final_text if self.last_final_text else None,
-                        "beam_size": 2,  # Faster for interim (was 1, but 2 gives better quality)
-                        "best_of": 2,  # Faster for interim
+                        "beam_size": 1,
+                        "best_of": 1,
                         "temperature": 0,
                     }
-                    try:
-                        import torch
-                        if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                            transcribe_kwargs["fp16"] = True
-                    except:
-                        pass
                     
                     result = self.model.transcribe(audio_data, **transcribe_kwargs)
                     language = interim_lang
@@ -659,7 +710,7 @@ class WhisperOfflineSTT:
                                         detection_audio,  # Pass numpy array directly, Whisper handles conversion
                                         language=test_lang,
                                         task="transcribe",  # CRITICAL: transcribe, not translate
-                                        fp16=False,
+                                        fp16=self.use_fp16,
                                         verbose=False,
                                         beam_size=1,  # Minimal for speed
                                         best_of=1,  # Minimal for speed
@@ -765,24 +816,18 @@ class WhisperOfflineSTT:
                         transcribe_kwargs = {
                             "language": detected_language,
                             "task": "transcribe",  # CRITICAL: transcribe, not translate
-                            "fp16": False,
+                            "fp16": self.use_fp16,
                             "verbose": False,
                             "condition_on_previous_text": True,
                             "initial_prompt": self.last_final_text if self.last_final_text else None,
-                            "beam_size": 5,
-                            "best_of": 5,
+                            "beam_size": 2,
+                            "best_of": 2,
                             "temperature": 0,
                             "compression_ratio_threshold": 2.4,
                             "logprob_threshold": -1.0,
                             "no_speech_threshold": 0.6,
-                            "word_timestamps": True,
+                            "word_timestamps": False,
                         }
-                        try:
-                            import torch
-                            if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                                transcribe_kwargs["fp16"] = True
-                        except:
-                            pass
                         
                         result = self.model.transcribe(audio_data, **transcribe_kwargs)
                         result_lang = result.get("language", detected_language)
@@ -854,24 +899,18 @@ class WhisperOfflineSTT:
                             transcribe_kwargs = {
                                 "language": lang,
                                 "task": "transcribe",  # CRITICAL: transcribe, not translate
-                                "fp16": False,
+                                "fp16": self.use_fp16,
                                 "verbose": False,
                                 "condition_on_previous_text": True,
                                 "initial_prompt": self.last_final_text if self.last_final_text else None,
-                                "beam_size": 5,
-                                "best_of": 5,
+                                "beam_size": 2,
+                                "best_of": 2,
                                 "temperature": 0,
                                 "compression_ratio_threshold": 2.4,
                                 "logprob_threshold": -1.0,
                                 "no_speech_threshold": 0.6,
-                                "word_timestamps": True,
+                                "word_timestamps": False,
                             }
-                            try:
-                                import torch
-                                if torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                                    transcribe_kwargs["fp16"] = True
-                            except:
-                                pass
                             
                             test_result = self.model.transcribe(audio_data, **transcribe_kwargs)
                             test_text = test_result.get("text", "").strip()
@@ -945,12 +984,12 @@ class WhisperOfflineSTT:
                         transcribe_kwargs = {
                             "language": "en",
                             "task": "transcribe",
-                            "fp16": False,
+                            "fp16": self.use_fp16,
                             "verbose": False,
                             "condition_on_previous_text": True,
                             "initial_prompt": self.last_final_text if self.last_final_text else None,
-                            "beam_size": 3,
-                            "best_of": 3,
+                            "beam_size": 2,
+                            "best_of": 2,
                             "temperature": 0,
                         }
                         result = self.model.transcribe(audio_data, **transcribe_kwargs)

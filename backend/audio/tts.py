@@ -4,6 +4,8 @@ import logging
 import re
 import os
 import sys
+import subprocess
+import inspect
 
 # CRITICAL: Disable MPS BEFORE any torch imports (for MeloTTS on macOS)
 if sys.platform == "darwin":
@@ -55,6 +57,13 @@ except ImportError:
     _HAS_PYKOKORO = False
     build_pipeline = None
 
+# Try to import ONNX Runtime for provider/device detection used by PyKokoro
+try:
+    import onnxruntime as ort
+    _HAS_ONNXRUNTIME = True
+except ImportError:
+    ort = None
+    _HAS_ONNXRUNTIME = False
 
 
 logger = logging.getLogger(__name__)
@@ -66,7 +75,7 @@ _mms_model_cache = {}  # Maps (model_id, device_str) -> (model, processor)
 _melotts_cache = {}  # Maps (language, device) -> TTS instance
 
 # Cache for PyKokoro TTS instances (English only)
-_pykokoro_cache_en = None  # English (82M model)
+_pykokoro_cache_en = {}  # Maps device -> English pipeline (82M model)
 
 # Constants for TTS configuration
 SPEED_MIN = 0.5
@@ -234,23 +243,130 @@ def _patch_melotts_for_cpu():
 
 
 def _get_device(device_preference: str) -> str:
-    """Determine the best device to use, avoiding MPS on macOS."""
-    if device_preference != "auto":
-        return device_preference
-    
-    # On macOS, force CPU to avoid MPS issues with BERT models
-    if sys.platform == "darwin":
-        return "cpu"
-    
-    # For other platforms, check for CUDA
+    """Determine execution device, preferring CUDA GPUs when available."""
+    return _get_device_for_engine(device_preference=device_preference, engine="general")
+
+
+def _torch_cuda_available() -> bool:
+    """Return True when PyTorch can use CUDA."""
     try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda:0"
-        else:
+        return torch is not None and torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _onnx_gpu_providers() -> list[str]:
+    """Return ONNX Runtime providers that can execute on GPU."""
+    if not _HAS_ONNXRUNTIME or ort is None:
+        return []
+    try:
+        providers = ort.get_available_providers()
+        gpu_providers = []
+        for name in ("CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider"):
+            if name in providers:
+                gpu_providers.append(name)
+        return gpu_providers
+    except Exception:
+        return []
+
+
+def _onnx_cuda_available() -> bool:
+    """Return True when ONNX Runtime reports CUDA provider availability."""
+    return "CUDAExecutionProvider" in _onnx_gpu_providers()
+
+
+def _get_device_for_engine(device_preference: str, engine: str = "general") -> str:
+    """
+    Determine execution device for the given engine.
+    - general: Torch-based paths (MeloTTS/MMS) rely on torch CUDA availability.
+    - pykokoro: ONNX-based path relies on ONNX Runtime CUDA provider availability.
+    """
+    pref = (device_preference or "auto").lower().strip()
+    if pref in ("gpu", "cuda"):
+        pref = "cuda:0"
+
+    torch_cuda_ok = _torch_cuda_available()
+    onnx_gpu_providers = _onnx_gpu_providers()
+    onnx_cuda_ok = "CUDAExecutionProvider" in onnx_gpu_providers
+    onnx_gpu_ok = len(onnx_gpu_providers) > 0
+    cuda_available = onnx_gpu_ok if engine == "pykokoro" else torch_cuda_ok
+
+    if pref != "auto":
+        if pref.startswith("cuda"):
+            if cuda_available:
+                return "cuda:0" if pref == "cuda" else pref
+            if engine == "pykokoro":
+                logger.warning(
+                    "GPU requested for PyKokoro, but no ONNX Runtime GPU provider is available. "
+                    "Install onnxruntime-gpu (or onnxruntime-directml) and restart. Falling back to CPU."
+                )
+            else:
+                logger.warning("CUDA requested but unavailable. Falling back to CPU.")
             return "cpu"
-    except ImportError:
+        if pref == "mps":
+            try:
+                if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    return "mps"
+            except Exception:
+                pass
+            logger.warning("MPS requested but unavailable. Falling back to CPU.")
+            return "cpu"
+        return pref
+
+    # Auto mode: prefer CUDA on Windows/Linux; prefer MPS on macOS when available.
+    if sys.platform == "darwin":
+        try:
+            if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
         return "cpu"
+
+    if cuda_available:
+        return "cuda:0"
+
+    if engine == "pykokoro":
+        logger.info(
+            "PyKokoro running on CPU. ONNX Runtime GPU provider not detected. Current providers: %s",
+            ort.get_available_providers() if _HAS_ONNXRUNTIME and ort is not None else ["not-installed"],
+        )
+    return "cpu"
+
+
+def _build_pykokoro_pipeline_for_device(lang: str, target_device: str):
+    """Build a PyKokoro pipeline with provider-aware GPU selection."""
+    from pykokoro import PipelineConfig, GenerationConfig
+
+    generation = GenerationConfig(lang=lang)
+
+    pref = (target_device or "auto").lower().strip()
+    provider = "auto"
+    provider_options = None
+
+    if pref.startswith("cuda"):
+        provider = "cuda"
+        # Allow "cuda:1" style device hints when multiple GPUs exist.
+        if ":" in pref:
+            try:
+                provider_options = {"device_id": int(pref.split(":", 1)[1])}
+            except Exception:
+                provider_options = {"device_id": 0}
+        else:
+            provider_options = {"device_id": 0}
+    elif pref == "cpu":
+        provider = "cpu"
+    elif pref == "mps":
+        # PyKokoro uses CoreML provider naming on Apple platforms.
+        provider = "coreml"
+
+    config = PipelineConfig(
+        generation=generation,
+        provider=provider,
+        provider_options=provider_options,
+    )
+
+    # Force early provider/session initialization so we fail fast instead of silently running CPU.
+    return build_pipeline(config=config, eager=True)
 
 
 def _has_mixed_scripts(text: str) -> bool:
@@ -508,6 +624,44 @@ def _resample_if_needed(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarr
     if _HAS_LIBROSA:
         return librosa.resample(audio.astype(np.float32), orig_sr=src_sr, target_sr=dst_sr).astype(np.float32)
     return _resample_linear(audio, src_sr, dst_sr)
+
+
+def _ensure_spacy_model(model_name: str) -> bool:
+    """
+    Ensure a spaCy language model is available.
+    Returns True if present (or successfully downloaded), False otherwise.
+    """
+    try:
+        import spacy
+    except ImportError:
+        logger.warning("spaCy is not installed; cannot auto-install language model '%s'.", model_name)
+        return False
+
+    try:
+        spacy.load(model_name)
+        return True
+    except OSError:
+        logger.info("spaCy model '%s' not found. Attempting automatic download...", model_name)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "spacy", "download", model_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            spacy.load(model_name)
+            logger.info("✓ spaCy model '%s' downloaded successfully.", model_name)
+            return True
+        except Exception as download_error:
+            logger.warning(
+                "Automatic spaCy model download failed for '%s': %s",
+                model_name,
+                download_error,
+            )
+            return False
+    except Exception as check_error:
+        logger.warning("Unable to verify spaCy model '%s': %s", model_name, check_error)
+        return False
 
 
 def _synthesize_melotts(
@@ -823,7 +977,7 @@ def synthesize_speech(
         text: The content to speak.
         language: Language code ("en", "ja", "zh", etc.) or "auto" for auto-detection.
         speed: Playback speed multiplier (1.0 = normal, 1.2 = 20% faster, 0.9 = 10% slower).
-        device_preference: Device to use ("auto", "cpu", or "mps").
+        device_preference: Device to use ("auto", "cpu", "cuda", "cuda:0", or "mps").
 
     Returns:
         Tuple of (audio_bytes, sample_rate) where audio_bytes is WAV file bytes.
@@ -870,31 +1024,35 @@ def synthesize_speech(
         if _HAS_PYKOKORO:
             try:
                 logger.info(f"Using PyKokoro-82M for English TTS (offline-capable)")
+
+                # PyKokoro English sentence splitting depends on this spaCy model.
+                # Auto-install once if missing to avoid crashing on first use.
+                _ensure_spacy_model("en_core_web_sm")
+                target_device = _get_device_for_engine(device_preference, engine="pykokoro")
                 
                 # Check cache first - use separate cache for English
-                if '_pykokoro_cache_en' not in globals():
-                    _pykokoro_cache_en = None
+                if not isinstance(_pykokoro_cache_en, dict):
+                    _pykokoro_cache_en = {}
                 
-                if _pykokoro_cache_en is None:
-                    logger.info("Initializing PyKokoro TTS pipeline with English language support (82M model)...")
-                    # Configure pipeline for English language
-                    try:
-                        from pykokoro import PipelineConfig, GenerationConfig
-                        config = PipelineConfig(
-                            generation=GenerationConfig(lang='en')
-                        )
-                        _pykokoro_cache_en = build_pipeline(config=config)
-                        logger.info("✓ PyKokoro pipeline initialized and cached (English mode, 82M model)")
-                    except Exception as config_error:
-                        logger.warning(f"Failed to configure English language, using default: {config_error}")
-                        _pykokoro_cache_en = build_pipeline()
-                        logger.info("✓ PyKokoro pipeline initialized and cached (default mode)")
+                if target_device not in _pykokoro_cache_en:
+                    logger.info(
+                        "Initializing PyKokoro English pipeline (82M model) on device: %s",
+                        target_device,
+                    )
+                    _pykokoro_cache_en[target_device] = _build_pykokoro_pipeline_for_device(
+                        lang='en',
+                        target_device=target_device,
+                    )
+                    logger.info(
+                        "✓ PyKokoro pipeline initialized and cached (English mode, device=%s)",
+                        target_device,
+                    )
                 else:
-                    logger.debug("Using cached PyKokoro pipeline (English)")
+                    logger.debug("Using cached PyKokoro pipeline (English, device=%s)", target_device)
                 
                 # Synthesize with PyKokoro
                 from pykokoro import GenerationConfig
-                result = _pykokoro_cache_en.run(text, generation=GenerationConfig(lang='en'))
+                result = _pykokoro_cache_en[target_device].run(text, generation=GenerationConfig(lang='en'))
                 
                 # Extract audio data from AudioResult
                 audio_array = result.audio
@@ -932,8 +1090,15 @@ def synthesize_speech(
                 
                 # Provide helpful error messages for common issues
                 if "spacy" in error_msg.lower() or "en_core_web_sm" in error_msg.lower():
+                    auto_fix_hint = ""
+                    if _ensure_spacy_model("en_core_web_sm"):
+                        auto_fix_hint = (
+                            "Automatic model installation completed. "
+                            "Please retry the request.\n"
+                        )
                     raise RuntimeError(
                         f"PyKokoro requires spaCy language models for English. "
+                        f"{auto_fix_hint}"
                         f"Install with:\n"
                         f"  pip install spacy\n"
                         f"  python -m spacy download en_core_web_sm  # Required for English\n"
@@ -1530,17 +1695,13 @@ def synthesize_speech(
         try:
             logger.info(f"Using MMS-TTS model for language: {language} (offline-capable)")
             
-            # Set up device
-            if device_preference == "mps":
-                device = (
-                    torch.device("mps")
-                    if torch.backends.mps.is_available()
-                    else torch.device("cpu")
-                )
-            elif device_preference == "cpu":
+            # Set up device with unified selection logic (auto prefers CUDA when available)
+            selected_device = _get_device(device_preference)
+            try:
+                device = torch.device(selected_device)
+            except Exception:
+                logger.warning("Invalid device '%s' for MMS-TTS. Falling back to CPU.", selected_device)
                 device = torch.device("cpu")
-            else:
-                device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
             
             # Check cache first to avoid reloading model on each request
             cache_key = f"{model_id}_{device}"
