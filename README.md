@@ -42,59 +42,70 @@ Transform speech to text and text to speech in real-time with support for **Engl
 cd Factory_STT_TTS
 
 # Create virtual environment
-python3 -m venv .venv
+python3.11 -m venv .venv  # Mac/Linux
+# OR
+py -3.11 -m venv .venv      # Windows
 
 # Activate virtual environment
 source .venv/bin/activate  # Mac/Linux
 # OR
-.venv\Scripts\activate      # Windows
+.\.venv\Scripts\activate      # Windows
 
 # Install core dependencies
 pip install -r requirements.txt
 ```
 
-### Step 2: Install TTS Engines (Optional)
+### Step 2: Install TTS Engines
 
-**For English TTS:**
+**For English TTS:(Optional-The first run automatically download this if not found.)**
 ```bash
 pip install pykokoro spacy
 python -m spacy download en_core_web_sm
 ```
 
-**For Chinese TTS:**
-```bash
-git clone https://github.com/myshell-ai/MeloTTS.git
-cd MeloTTS
-pip install -e .
-cd ..
-pip install nltk
-python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')"
-```
-
-**For Japanese TTS:**
+**For Chinese & Japanese TTS:**
 ```bash
 git clone https://github.com/myshell-ai/MeloTTS.git
 cd MeloTTS
 pip install -e .
 python -m unidic download
-cd ..
 ```
 
-> **💡 Tip:** You only need to install the TTS engines for languages you plan to use. STT works without any TTS setup.
+
+### GPU Acceleration (NVIDIA, Optional but Recommended)
+
+If your PC has an NVIDIA GPU and you want faster TTS/STT:
+
+```bash
+# Activate venv first
+.venv\Scripts\activate      # Windows
+# source .venv/bin/activate # Mac/Linux
+
+# Switch runtime variants (safe to run even if not present)
+pip uninstall -y onnxruntime onnxruntime-gpu torch torchvision torchaudio
+
+# Install CUDA-enabled PyTorch wheels (example: CUDA 12.4)
+pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+
+# Install ONNX Runtime GPU provider (required by PyKokoro GPU path)
+pip install onnxruntime-gpu
+```
+
+Verify GPU availability:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+Expected:
+- `torch.cuda.is_available()` is `True`
+- ONNX providers include `CUDAExecutionProvider`
 
 ### Step 3: Run the Server
 
 ```bash
 python3 run_server.py
-```
-
-**Access the application:**
-- Open your browser and go to: `http://localhost:5421`
-- For HTTPS (if certificates exist): `https://localhost:5421`
-
-**Generate SSL certificates (optional):**
-```bash
-python3 generate_certs.py
 ```
 
 ---

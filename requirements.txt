@@ -1,47 +1,41 @@
+# Core server/runtime
 flask
 flask-socketio
 flask-cors
 eventlet
-numpy
-webrtcvad
-websocket-client
-scipy
-openai
 python-dotenv
 setuptools<81
+numpy
+scipy
+
+# Audio capture / streaming
 sounddevice
 pyaudio
+webrtcvad
+
+# Denoising / audio IO
 pyrnnoise
 rnnoise-cli
-requests
-audiolab
-
-# TTS dependencies (optional - install if you want to use TTS feature)
-# All TTS engines are offline-capable after initial model download
-# For English TTS (PyKokoro-82M - offline-capable, replaces MMS-TTS):
-torch>=2.0.0
-transformers>=4.30.0
-datasets>=2.0.0
 soundfile>=0.12.0
-
-# For Chinese TTS (PyKokoro - offline-capable, faster than Piper):
-# Uses same dependencies as Japanese (pykokoro, spacy)
-# No longer using Piper TTS for Chinese (removed g2pw, unicode-rbnf, sentence-stream dependencies)
-
-# For Japanese/Chinese TTS (PyKokoro - offline-capable, alternative to MMS/OpenJTalk/Piper):
-pykokoro>=0.6.5
-pyopenjtalk  # Required by PyKokoro for Japanese G2P
-spacy>=3.7.0  # Required by PyKokoro for text processing
-cn2an>=0.5.17  # Required by PyKokoro for Chinese number conversion
-jieba>=0.42.1  # Required by PyKokoro for Chinese word segmentation
-ordered_set
-pypinyin
-
-# For MeloTTS (Chinese/Japanese) - required for mixed Chinese-English or Japanese-English text:
-nltk>=3.8  # Required by MeloTTS for processing English words in Chinese/Japanese text
-
-# For speed adjustment:
 librosa>=0.10.0
 
-# For offline STT (Whisper):
+# Offline STT (Whisper)
 openai-whisper>=20231117
+torch>=2.0.0
+
+# TTS (PyKokoro / MeloTTS)
+transformers>=4.30.0
+pykokoro>=0.6.5
+spacy>=3.7.0
+pyopenjtalk
+cn2an>=0.5.17
+jieba>=0.42.1
+ordered_set
+pypinyin
+nltk>=3.8
+
+# ONNX runtime (PyKokoro backend)
+# - Windows/Linux: prefer GPU build
+# - macOS: CPU/CoreML-compatible fallback
+onnxruntime-gpu; platform_system != "Darwin"
+onnxruntime; platform_system == "Darwin"

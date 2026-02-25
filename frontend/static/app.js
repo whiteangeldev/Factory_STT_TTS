@@ -22,7 +22,7 @@ class STTApp {
         // UI-only display state (separate from VAD detection to prevent flicker)
         this.currentVadDisplayState = false;
         this._vadUiHoldUntil = 0;
-        this.vadUiHoldMs = 800; // Hold "Speech Detected" for 800ms during brief dips
+        this.vadUiHoldMs = 2500; // Hold "Speech Detected" for 2.5s during brief dips (stable during speech)
         
         // TTS state
         this.ttsAudio = null;
@@ -53,14 +53,23 @@ class STTApp {
     }
     
     initializeVADIndicator() {
-        // Initialize VAD indicator to "No Speech" state
+        // Initialize both badges to "No Speech" (single source of truth)
+        this.updateVadBadges(false);
+    }
+
+    /**
+     * Update both VAD badges from one state: header (topic) and STT section badge.
+     * Call this whenever VAD display state changes so they stay in sync.
+     * @param {boolean} hasSpeech - true = Speech Detected, false = No Speech
+     */
+    updateVadBadges(hasSpeech) {
+        this.currentVadDisplayState = hasSpeech;
         const vadDot = document.getElementById('vadDot');
-        const vadStatus = document.querySelector('.vad-text');
-        if (vadDot) {
-            vadDot.classList.remove('active');
-        }
-        if (vadStatus) {
-            vadStatus.textContent = 'No Speech';
+        const vadStatus = document.getElementById('vadStatus');
+        if (vadDot) vadDot.classList.toggle('active', hasSpeech);
+        if (vadStatus) vadStatus.textContent = hasSpeech ? 'Speech Detected' : 'No Speech';
+        if (this.isRecording) {
+            this.updateSystemStatus(hasSpeech ? 'speech_detected' : 'listening', hasSpeech ? 'Speech Detected' : 'Listening...');
         }
     }
     
@@ -115,6 +124,7 @@ class STTApp {
                     // Server confirmed recording stopped
                     this.isRecording = false;
                     recordBtn.classList.remove('recording');
+                    this.resetVadIndicator();
                 }
             }
         });
@@ -191,53 +201,17 @@ class STTApp {
     }
     
     setupEventListeners() {
-        // Recording controls - press and hold to record
+        // Recording controls - click to start, click again to stop
         const recordBtn = document.getElementById('recordBtn');
-        const recordBtnText = document.getElementById('recordBtnText');
         
-        // Mouse events
-        recordBtn.addEventListener('mousedown', (e) => {
+        recordBtn.addEventListener('click', (e) => {
             e.preventDefault();
-            if (!this.isRecording) {
+            if (this.isRecording) {
+                this.stopRecording();
+            } else {
                 this.startRecording();
             }
         });
-        
-        recordBtn.addEventListener('mouseup', (e) => {
-            e.preventDefault();
-            if (this.isRecording) {
-                this.stopRecording();
-            }
-        });
-        
-        recordBtn.addEventListener('mouseleave', (e) => {
-            // Stop recording if mouse leaves button while pressed
-            if (this.isRecording) {
-                this.stopRecording();
-            }
-        });
-        
-        // Touch events for mobile
-        recordBtn.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            if (!this.isRecording) {
-                this.startRecording();
-            }
-        }, { passive: false });
-        
-        recordBtn.addEventListener('touchend', (e) => {
-            e.preventDefault();
-            if (this.isRecording) {
-                this.stopRecording();
-            }
-        }, { passive: false });
-        
-        recordBtn.addEventListener('touchcancel', (e) => {
-            e.preventDefault();
-            if (this.isRecording) {
-                this.stopRecording();
-            }
-        }, { passive: false });
         
         // Save button
         document.getElementById('saveBtn').addEventListener('click', () => this.saveRecording());
@@ -435,6 +409,15 @@ class STTApp {
         }
     }
     
+    resetVadIndicator() {
+        this.currentVadState = false;
+        this._vadUiHoldUntil = 0;
+        this._speechEnded = false;
+        this._speechEndedCount = 0;
+        this.vadHistory = [];
+        this.updateVadBadges(false);
+    }
+
     stopRecording() {
         if (!this.isRecording) return;
         
@@ -443,6 +426,9 @@ class STTApp {
         
         // Set recording flag to false to stop any in-flight processing
         this.isRecording = false;
+        
+        // Reset VAD indicator so badge shows "No Speech" when recording stops
+        this.resetVadIndicator();
         
         // Notify backend that recording has stopped IMMEDIATELY
         if (this.socket && this.socket.connected) {
@@ -595,6 +581,16 @@ class STTApp {
     }
     
     handleProcessedAudio(data) {
+        // Update level and speech state first for real-time UI (before any early return)
+        if (data.audio_level_db !== undefined) {
+            const audioLevelEl = document.getElementById('audioLevel');
+            if (audioLevelEl) audioLevelEl.textContent = `${data.audio_level_db.toFixed(1)} dB`;
+        }
+        if (data.speech_state) {
+            const speechStateEl = document.getElementById('speechState');
+            if (speechStateEl) speechStateEl.textContent = data.speech_state;
+        }
+
         // Store audio chunks for saving (in system audio mode, audio comes from server)
         if (this.isRecording && this.inputMode === 'system') {
             // Debug: Log first few to verify storage is attempted
@@ -692,33 +688,22 @@ class STTApp {
             }
         }
         
-        // Update VAD indicator (green dot in metrics) with smoothing to prevent swing
-        const vadDot = document.getElementById('vadDot');
-        const vadStatus = document.getElementById('vadStatus');
-        
+        // Update VAD indicator (both badges) with smoothing to prevent swing
         if (data.has_speech !== undefined) {
-            // If speech_end event was received, force silence state
+            // If speech_end event was received, force silence state (don't flip back to Speech on noise)
             if (this._speechEnded) {
-                // Reset flag after a few silence chunks
                 if (!data.has_speech && data.speech_state === 'silence') {
                     if (!this._speechEndedCount) this._speechEndedCount = 0;
                     this._speechEndedCount++;
-                    if (this._speechEndedCount >= 3) {
+                    if (this._speechEndedCount >= 5) {
                         this._speechEnded = false;
                         this._speechEndedCount = 0;
                     }
                 }
-                // Force silence state
                 if (this.currentVadState || this.currentVadDisplayState) {
                     this.currentVadState = false;
-                    this.currentVadDisplayState = false;
                     this._vadUiHoldUntil = 0;
-                    const vadDot = document.getElementById('vadDot');
-                    const vadStatus = document.querySelector('.vad-text');
-                    if (vadDot) vadDot.classList.remove('active');
-                    if (vadStatus) {
-                        vadStatus.textContent = 'No Speech';
-                    }
+                    this.updateVadBadges(false);
                 }
                 return;  // Skip smoothing logic when speech has ended
             }
@@ -740,17 +725,15 @@ class STTApp {
             const backendSaysSilence = (data.speech_state === 'silence');
             
             if (this.currentVadState) {
-                // Currently in speech state
+                // Currently in speech state - stay sticky to avoid "No Speech" flicker during speech
                 if (backendSaysSilence) {
-                    // Backend says silence - exit if 3+ chunks are silence (speechCount <= 2)
-                    smoothedSpeech = (speechCount >= 3);  // Stay only if 3+ chunks are speech
+                    smoothedSpeech = (speechCount >= 2);  // Exit when 4+ of 5 are silence
                 } else {
-                    // Backend still says speech - use normal hysteresis (exit if 4+ chunks are silence)
-                    smoothedSpeech = (speechCount >= 2);  // Stay if 2+ chunks are speech
+                    // Backend says speech - require all 5 silence to exit (very stable during speech)
+                    smoothedSpeech = (speechCount >= 1);  // Stay if any of last 5 chunks is speech
                 }
             } else {
-                // Currently in no-speech state - require stronger evidence to enter (4+ speech chunks)
-                // This reduces false positives from background noise
+                // Currently in no-speech state - require strong evidence to enter (4+ speech chunks)
                 smoothedSpeech = (speechCount >= 4);  // Enter speech if 4+ out of 5 chunks are speech
             }
             
@@ -769,56 +752,18 @@ class STTApp {
             }
             
             // Determine UI display state:
-            // - Show "Speech Detected" if smoothed state says speech OR we're within hold period
-            // - Only switch to "No Speech" if hold period expired AND backend says silence
-            let displaySpeech = smoothedSpeech || backendSaysSpeech || (
-                this.currentVadDisplayState &&
-                nowUi < this._vadUiHoldUntil &&
-                !backendSaysSilence
+            // - When backend says speech (speech_state === 'speech'), always show "Speech Detected" (stable during speech)
+            // - When backend says silence, show "No Speech" if we have strong silence evidence or hold expired
+            const strongSilenceEvidence = (speechCount === 0);
+            let displaySpeech = backendSaysSpeech || (
+                !backendSaysSilence &&
+                (strongSilenceEvidence ? false : (smoothedSpeech || (
+                    this.currentVadDisplayState && nowUi < this._vadUiHoldUntil && !strongSilenceEvidence
+                )))
             );
             
-            // Update UI only if display state changed
             if (displaySpeech !== this.currentVadDisplayState) {
-                this.currentVadDisplayState = displaySpeech;
-                
-                if (displaySpeech) {
-                    // Speech detected - show green dot
-                    if (vadDot) vadDot.classList.add('active');
-                    if (vadStatus) {
-                        vadStatus.textContent = 'Speech Detected';
-                    }
-                } else {
-                    // No speech - hide green dot
-                    if (vadDot) vadDot.classList.remove('active');
-                    if (vadStatus) {
-                        vadStatus.textContent = 'No Speech';
-                    }
-                }
-            }
-            
-            // Update header status (top center dot) using UI display state
-            if (this.isRecording) {
-                if (this.currentVadDisplayState) {
-                    this.updateSystemStatus('speech_detected', 'Speech Detected');
-                } else {
-                    this.updateSystemStatus('listening', 'Listening...');
-                }
-            }
-        }
-        
-        // Update metrics
-        if (data.audio_level_db !== undefined) {
-            const audioLevelEl = document.getElementById('audioLevel');
-            if (audioLevelEl) {
-                audioLevelEl.textContent = `${data.audio_level_db.toFixed(1)} dB`;
-            }
-        }
-        
-        
-        if (data.speech_state) {
-            const speechStateEl = document.getElementById('speechState');
-            if (speechStateEl) {
-                speechStateEl.textContent = data.speech_state;
+                this.updateVadBadges(displaySpeech);
             }
         }
     }
@@ -828,26 +773,14 @@ class STTApp {
         const eventData = data.data || {};
         
         if (eventType === 'speech_start') {
-            this.updateSystemStatus('speech_detected', 'Speech Detected');
+            this.updateVadBadges(true);
             this.log('Speech detected', 'success');
         } else if (eventType === 'speech_end') {
-            // Force clear VAD state immediately when speech ends
-            // Set a flag to prevent smoothing from overriding this
             this._speechEnded = true;
             this.currentVadState = false;
-            this.currentVadDisplayState = false;
             this._vadUiHoldUntil = 0;
-            this.vadHistory = [];  // Clear VAD history
-            
-            // Update VAD indicator UI immediately
-            const vadDot = document.getElementById('vadDot');
-            const vadStatus = document.querySelector('.vad-text');
-            if (vadDot) vadDot.classList.remove('active');
-            if (vadStatus) {
-                vadStatus.textContent = 'No Speech';
-            }
-            
-            this.updateSystemStatus('listening', 'Listening...');
+            this.vadHistory = [];
+            this.updateVadBadges(false);
             this.log(`Speech ended (duration: ${eventData.duration?.toFixed(2)}s)`, 'info');
         }
     }
@@ -856,65 +789,69 @@ class STTApp {
         const text = data.text || '';
         if (!text) return;
         
-        // Remove any interim transcription for this segment
         this.currentInterimText = '';
         const area = document.getElementById('transcriptionArea');
         
-        // Remove empty state if present
         const emptyState = area.querySelector('.empty-state');
-        if (emptyState) {
-            emptyState.remove();
-        }
+        if (emptyState) emptyState.remove();
         
         const existingInterim = area.querySelector('.transcription-entry.interim');
-        if (existingInterim) {
-            existingInterim.remove();
+        if (existingInterim) existingInterim.remove();
+        
+        const now = Date.now() / 1000;
+        const finalEntries = area.querySelectorAll('.transcription-entry.final');
+        const lastFinal = finalEntries.length ? finalEntries[finalEntries.length - 1] : null;
+        const lastFinalTs = lastFinal ? parseFloat(lastFinal.getAttribute('data-final-ts') || '0') : 0;
+        // If a final was added in the last 15s, backend may be sending the full-session result to replace interim
+        const replaceLast = lastFinal && (now - lastFinalTs < 15);
+        
+        if (replaceLast) {
+            const lang = data.language || 'auto';
+            const langBadge = `<span class="lang-badge">${lang.toUpperCase()}</span>`;
+            lastFinal.innerHTML = `
+                <div class="transcription-text">${this.escapeHtml(text)}</div>
+                <div class="transcription-meta">${langBadge}</div>
+            `;
+            lastFinal.setAttribute('data-final-ts', String(now));
+            if (this.transcriptionHistory.length) this.transcriptionHistory[this.transcriptionHistory.length - 1] = {
+                text: text,
+                timestamp: data.timestamp || now,
+                confidence: data.confidence || 1.0,
+                is_final: true
+            };
+            this.log(`Final transcription updated (full session): ${text.substring(0, 50)}...`, 'success');
+        } else {
+            let latencyInfo = '';
+            if (data.timestamp && this.lastTranscriptionTime) {
+                const latency = ((data.timestamp - this.lastTranscriptionTime) * 1000).toFixed(0);
+                latencyInfo = ` <span class="latency-badge">${latency}ms</span>`;
+            }
+            this.lastTranscriptionTime = data.timestamp || now;
+            const lang = data.language || 'auto';
+            const langBadge = `<span class="lang-badge">${lang.toUpperCase()}</span>`;
+            const item = document.createElement('div');
+            item.className = 'transcription-entry final';
+            item.setAttribute('data-final-ts', String(now));
+            item.innerHTML = `
+                <div class="transcription-text">${this.escapeHtml(text)}</div>
+                <div class="transcription-meta">${langBadge}${latencyInfo}</div>
+            `;
+            area.appendChild(item);
+            this.transcriptionHistory.push({
+                text: text,
+                timestamp: data.timestamp || now,
+                confidence: data.confidence || 1.0,
+                is_final: true
+            });
+            this.log(`Final transcription: ${text.substring(0, 50)}...`, 'success');
         }
         
-        // Calculate latency if timestamp provided
-        let latencyInfo = '';
-        if (data.timestamp && this.lastTranscriptionTime) {
-            const latency = ((data.timestamp - this.lastTranscriptionTime) * 1000).toFixed(0);
-            latencyInfo = ` <span class="latency-badge">${latency}ms</span>`;
-        }
-        this.lastTranscriptionTime = data.timestamp || Date.now() / 1000;
-        
-        // Create final transcription entry
-        const item = document.createElement('div');
-        item.className = 'transcription-entry final';
-        
-        // Language detection badge
-        const lang = data.language || 'auto';
-        const langBadge = `<span class="lang-badge">${lang.toUpperCase()}</span>`;
-        
-        item.innerHTML = `
-            <div class="transcription-text">${this.escapeHtml(text)}</div>
-            <div class="transcription-meta">
-                ${langBadge}
-                ${latencyInfo}
-            </div>
-        `;
-        
-        area.appendChild(item);
         this.scrollToBottom(area);
-        
-        // Add to history
-        this.transcriptionHistory.push({
-            text: text,
-            timestamp: data.timestamp || Date.now() / 1000,
-            confidence: data.confidence || 1.0,
-            is_final: true
-        });
-        
-        // Update transcription count based on actual DOM entries
         this.updateTranscriptionStats();
-        
-        this.log(`Final transcription: ${text.substring(0, 50)}...`, 'success');
     }
     
     handleInterimTranscription(data) {
         const text = data.text || '';
-        const incrementalText = data.incremental_text || null;
         if (!text) return;
         
         this.currentInterimText = text;
@@ -947,43 +884,15 @@ class STTApp {
             latencyInfo = ` <span class="latency-badge first">${latency}ms</span>`;
         }
         
-        // Update interim entry with streaming effect
-        if (incrementalText && !isNewEntry) {
-            // Streaming mode: append only new words
-            const textElement = existingInterim.querySelector('.transcription-text');
-            if (textElement) {
-                // Append new words with smooth animation
-                const newWordsSpan = document.createElement('span');
-                newWordsSpan.className = 'new-words';
-                newWordsSpan.textContent = incrementalText;
-                textElement.appendChild(document.createTextNode(' '));
-                textElement.appendChild(newWordsSpan);
-                
-                // Remove the 'new-words' class after a moment for smooth transition
-                setTimeout(() => {
-                    newWordsSpan.classList.remove('new-words');
-                    newWordsSpan.classList.add('normal-words');
-                }, 500);
-            } else {
-                // Fallback: update full text
-                existingInterim.innerHTML = `
-                    <div class="transcription-text">${this.escapeHtml(text)}</div>
-                    <div class="transcription-meta">
-                        <span class="lang-badge">PROCESSING</span>
-                        ${latencyInfo}
-                    </div>
-                `;
-            }
-        } else {
-            // First update or no incremental text: show full text
-            existingInterim.innerHTML = `
-                <div class="transcription-text">${this.escapeHtml(text)}</div>
-                <div class="transcription-meta">
-                    <span class="lang-badge">PROCESSING</span>
-                    ${latencyInfo}
-                </div>
-            `;
-        }
+        // Always render the latest full interim text from backend.
+        // Appending incremental chunks here causes visual drift when Whisper revises hypotheses.
+        existingInterim.innerHTML = `
+            <div class="transcription-text">${this.escapeHtml(text)}</div>
+            <div class="transcription-meta">
+                <span class="lang-badge">PROCESSING</span>
+                ${latencyInfo}
+            </div>
+        `;
         
         this.scrollToBottom(area);
     }

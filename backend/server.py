@@ -1,6 +1,10 @@
 """Flask-SocketIO server for real-time STT/TTS"""
 import eventlet
 eventlet.monkey_patch()
+try:
+    from eventlet import tpool as eventlet_tpool
+except Exception:
+    eventlet_tpool = None
 
 import base64
 import logging
@@ -25,6 +29,7 @@ except ImportError:
 from .config import AudioConfig
 from .audio.pipeline import AudioPipeline
 from .audio.system_audio import SystemAudioCapture
+from .audio.stt_whisper_offline import WhisperOfflineSTT
 
 # Try to import TTS (optional - server can run without it)
 try:
@@ -36,7 +41,9 @@ except (ImportError, RuntimeError, PermissionError) as e:
     _HAS_TTS = False
     synthesize_speech = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_LOG_LEVEL = os.getenv("FACTORY_LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL_VALUE = getattr(logging, _LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=_LOG_LEVEL_VALUE, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Suppress SSL errors and eventlet noise
@@ -70,6 +77,10 @@ class FilteredStderr:
     def write(self, text):
         global _ssl_error_active, _ssl_error_lines
         text_str = str(text)
+        
+        # Suppress tqdm/progress-bar noise from model internals.
+        if re.match(r'^\s*\d+%\|', text_str) or "frames/s]" in text_str:
+            return
         
         # Detect SSL errors (various patterns)
         ssl_error_patterns = [
@@ -161,11 +172,40 @@ class FilteredStderr:
 
 sys.stderr = FilteredStderr(_original_stderr)
 
+
+class FilteredStdout:
+    def __init__(self, original):
+        self.original = original
+
+    def write(self, text):
+        text_str = str(text)
+        # Suppress tqdm/progress-bar noise from model internals.
+        if re.match(r'^\s*\d+%\|', text_str) or "frames/s]" in text_str:
+            return
+        self.original.write(text)
+
+    def flush(self):
+        self.original.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+sys.stdout = FilteredStdout(sys.stdout)
+
 app = Flask(__name__, static_folder='../frontend/static', template_folder='../frontend')
 app.config['SECRET_KEY'] = 'factory-stt-tts-secret-key'
 CORS(app)
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    logger=False,
+    engineio_logger=False,
+    ping_interval=25,
+    ping_timeout=120,
+)
 
 config = AudioConfig()
 connected_clients = set()
@@ -177,6 +217,34 @@ client_audio_queues = {}  # Queues for passing audio from background threads to 
 MIN_CHUNK_SIZE = 480
 MIN_AUDIO_LEVEL = 0.0005
 MAX_TTS_SEGMENT_CHARS = 220
+_stt_preloader = None
+_STT_EMIT_TRACE = os.getenv("FACTORY_STT_EMIT_TRACE", "1").lower() not in {"0", "false", "off", "no"}
+
+
+def _log_stt_emit(client_id: str, event_type: str, payload: dict):
+    """Compact STT emit logging: interim text only."""
+    if not _STT_EMIT_TRACE:
+        return
+    if event_type != "transcription_interim":
+        return
+    text = ((payload or {}).get("text", "") or "").strip()
+    if text:
+        logger.info(f"[STT INTERIM] {text}")
+
+
+def _ensure_stt_preloaded():
+    """Warm-load Whisper model at page connect/server startup."""
+    global _stt_preloader
+    if _stt_preloader is not None:
+        return
+    try:
+        _stt_preloader = WhisperOfflineSTT(
+            model=config.WHISPER_MODEL,
+            sample_rate=16000,
+            on_transcript=None,
+        )
+    except Exception as e:
+        logger.warning(f"STT preload skipped: {e}")
 
 
 def _sanitize_tts_text_for_segmentation(text: str) -> str:
@@ -310,12 +378,24 @@ def _stream_tts_segments(
 
     try:
         for idx, segment_text in enumerate(safe_segments):
-            audio_bytes, sample_rate = synthesize_speech(
-                text=segment_text,
-                language=detected_lang,
-                speed=speed,
-                device_preference="auto"
-            )
+            # Offload heavy synthesis/model warmup to a native thread so
+            # eventlet heartbeat traffic can continue while TTS is running.
+            if eventlet_tpool is not None:
+                audio_bytes, sample_rate = eventlet_tpool.execute(
+                    synthesize_speech,
+                    segment_text,
+                    detected_lang,
+                    speed,
+                    "auto",
+                )
+            else:
+                # Fallback for environments where eventlet.tpool is unavailable.
+                audio_bytes, sample_rate = synthesize_speech(
+                    text=segment_text,
+                    language=detected_lang,
+                    speed=speed,
+                    device_preference="auto",
+                )
             audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
             total_bytes += len(audio_bytes)
 
@@ -380,6 +460,7 @@ def serve_static(path):
 @socketio.on('connect')
 def handle_connect():
     client_id = request.sid
+    _ensure_stt_preloaded()
     connected_clients.add(client_id)
     client_audio_buffers[client_id] = np.array([], dtype=np.float32)
     client_recording_state[client_id] = False
@@ -387,7 +468,7 @@ def handle_connect():
     emit('connected', {'status': 'ready', 'message': 'WebSocket ready'})
 
 @socketio.on('disconnect')
-def handle_disconnect():
+def handle_disconnect(reason=None):
     client_id = request.sid
     connected_clients.discard(client_id)
     client_audio_buffers.pop(client_id, None)
@@ -400,6 +481,10 @@ def handle_disconnect():
         client_system_audio.pop(client_id, None)
     
     logger.info(f"🔌 Client disconnected: {client_id} (remaining: {len(connected_clients)})")
+
+
+# Warm up model as soon as server module initializes.
+_ensure_stt_preloaded()
 
 @socketio.on('start_recording')
 def handle_start_recording(data=None):
@@ -414,19 +499,26 @@ def handle_start_recording(data=None):
         """Client-specific callback that emits to the correct client"""
         try:
             if event_type == "transcription":
-                socketio.emit("transcription", {
+                payload = {
                     "text": data.get("text", ""),
                     "language": data.get("language"),
                     "confidence": float(data.get("confidence", 0.0)),
+                    "timestamp": data.get("timestamp"),
                     "is_final": True
-                }, room=client_id)
+                }
+                _log_stt_emit(client_id, "transcription", payload)
+                socketio.emit("transcription", payload, room=client_id)
             elif event_type == "transcription_interim":
-                socketio.emit("transcription_interim", {
+                payload = {
                     "text": data.get("text", ""),
                     "language": data.get("language"),
                     "confidence": float(data.get("confidence", 0.0)),
+                    "timestamp": data.get("timestamp"),
+                    "incremental_text": data.get("incremental_text"),
                     "is_final": False
-                }, room=client_id)
+                }
+                _log_stt_emit(client_id, "transcription_interim", payload)
+                socketio.emit("transcription_interim", payload, room=client_id)
             else:
                 socketio.emit("speech_event", {
                     "type": "speech_event",
@@ -436,33 +528,49 @@ def handle_start_recording(data=None):
         except Exception as e:
             logger.error(f"Error emitting event to {client_id}: {e}")
     
-    client_pipelines[client_id] = AudioPipeline(config, event_callback=client_speech_callback)
+    client_pipelines[client_id] = AudioPipeline(
+        config,
+        event_callback=client_speech_callback,
+        input_mode=input_mode,
+    )
     client_pipelines[client_id].reset()
     
     # Both system audio and microphone: use server-side capture
     try:
-        # Use a queue to pass audio from background thread to eventlet context
+        # Use a queue to pass audio from background thread to eventlet context.
+        # Queue must be drained fast: capture produces ~33 chunks/sec (30ms each); processing must keep up.
         import queue
-        audio_event_queue = queue.Queue(maxsize=100)  # Limit queue size
+        audio_event_queue = queue.Queue(maxsize=500)  # Absorb bursts; drain loop below keeps up with capture
         client_audio_queues[client_id] = audio_event_queue
         
         def on_audio_chunk(audio_data):
             """Callback for server-side audio - queues for eventlet processing"""
             if not client_recording_state.get(client_id, False):
                 return
-            # Queue the audio data for processing in eventlet context
             try:
                 audio_event_queue.put_nowait((client_id, audio_data))
             except queue.Full:
-                pass  # Drop if queue is full (backpressure)
+                pass  # Drop only if queue full (should be rare with drain loop)
         
-        # Start background task to process queued audio in eventlet context
+        # Process queued audio: drain queue when data available so we keep up with capture (~33 chunks/sec).
+        # Single get(timeout=0.1) would process at most 10/sec and cause backlog + dropped chunks.
         def process_audio_queue():
             while client_recording_state.get(client_id, False) and client_id in client_audio_queues:
                 try:
-                    queued_client_id, audio_data = audio_event_queue.get(timeout=0.1)
+                    queued_client_id, audio_data = audio_event_queue.get(timeout=0.02)  # Short wait when empty
                     if queued_client_id in client_pipelines and client_pipelines[queued_client_id]:
                         _process_audio_chunk(queued_client_id, audio_data)
+                    # Drain available chunks (cap per iteration so we yield to event loop)
+                    drain_count = 0
+                    max_drain = 50
+                    while drain_count < max_drain:
+                        try:
+                            queued_client_id, audio_data = audio_event_queue.get_nowait()
+                            if queued_client_id in client_pipelines and client_pipelines[queued_client_id]:
+                                _process_audio_chunk(queued_client_id, audio_data)
+                            drain_count += 1
+                        except queue.Empty:
+                            break
                 except queue.Empty:
                     continue
                 except Exception as e:
@@ -497,29 +605,8 @@ def handle_stop_recording(data=None):
     client_id = request.sid
     client_recording_state[client_id] = False
     client_audio_buffers[client_id] = np.array([], dtype=np.float32)
-    
-    # CRITICAL: Stop pipeline processing first to ensure final transcription is generated
-    # Don't remove pipeline immediately - let it finish processing
-    pipeline = None
-    if client_id in client_pipelines:
-        pipeline = client_pipelines[client_id]
-        if pipeline:
-            # Stop the pipeline's STT stream to trigger final transcription
-            # This will process any remaining audio and generate the final transcription
-            try:
-                # Always call stop_stream to ensure final buffer is processed
-                # This is safe even if not currently speaking - it will just process any buffered audio
-                if hasattr(pipeline, 'streaming_stt') and pipeline.streaming_stt:
-                    if pipeline.streaming_stt.is_streaming:
-                        logger.info(f"🛑 Stopping STT stream for {client_id} to generate final transcription")
-                        pipeline.streaming_stt.stop_stream()
-                        # Wait for transcription to complete (stop_stream already waits internally, but add extra buffer)
-                        import time
-                        time.sleep(1.0)  # Additional wait to ensure transcription callback completes
-            except Exception as e:
-                logger.error(f"Error stopping pipeline STT: {e}", exc_info=True)
-    
-    # Stop server-side system audio if active
+
+    # Stop server-side capture first to prevent new chunks during finalization.
     if client_id in client_system_audio:
         client_system_audio[client_id].stop()
         client_system_audio.pop(client_id, None)
@@ -535,6 +622,19 @@ def handle_stop_recording(data=None):
                     queue.get_nowait()
                 except:
                     break
+
+    # Now stop pipeline STT and emit final transcription.
+    pipeline = None
+    if client_id in client_pipelines:
+        pipeline = client_pipelines[client_id]
+        if pipeline:
+            try:
+                if hasattr(pipeline, 'streaming_stt') and pipeline.streaming_stt:
+                    if pipeline.streaming_stt.is_streaming:
+                        logger.info(f"🛑 Stopping STT stream for {client_id} to generate final transcription")
+                        pipeline.streaming_stt.stop_stream()
+            except Exception as e:
+                logger.error(f"Error stopping pipeline STT: {e}", exc_info=True)
     
     # Now remove the pipeline after transcription should be complete
     # The pipeline callback will still work until this point, so transcriptions can be emitted
@@ -553,19 +653,26 @@ def _process_audio_chunk(client_id, audio_to_process):
                 """Client-specific callback that emits to the correct client"""
                 try:
                     if event_type == "transcription":
-                        socketio.emit("transcription", {
+                        payload = {
                             "text": data.get("text", ""),
                             "language": data.get("language"),
                             "confidence": float(data.get("confidence", 0.0)),
+                            "timestamp": data.get("timestamp"),
                             "is_final": True
-                        }, room=client_id)
+                        }
+                        _log_stt_emit(client_id, "transcription", payload)
+                        socketio.emit("transcription", payload, room=client_id)
                     elif event_type == "transcription_interim":
-                        socketio.emit("transcription_interim", {
+                        payload = {
                             "text": data.get("text", ""),
                             "language": data.get("language"),
                             "confidence": float(data.get("confidence", 0.0)),
+                            "timestamp": data.get("timestamp"),
+                            "incremental_text": data.get("incremental_text"),
                             "is_final": False
-                        }, room=client_id)
+                        }
+                        _log_stt_emit(client_id, "transcription_interim", payload)
+                        socketio.emit("transcription_interim", payload, room=client_id)
                     else:
                         socketio.emit("speech_event", {
                             "type": "speech_event",
@@ -575,7 +682,14 @@ def _process_audio_chunk(client_id, audio_to_process):
                 except Exception as e:
                     logger.error(f"Error emitting event to {client_id}: {e}")
             
-            client_pipelines[client_id] = AudioPipeline(config, event_callback=client_speech_callback)
+            fallback_input_mode = "microphone"
+            if client_id in client_system_audio and client_system_audio[client_id] is not None:
+                fallback_input_mode = getattr(client_system_audio[client_id], "input_type", "microphone")
+            client_pipelines[client_id] = AudioPipeline(
+                config,
+                event_callback=client_speech_callback,
+                input_mode=fallback_input_mode,
+            )
         except Exception as e:
             logger.error(f"Failed to create pipeline: {e}")
             client_pipelines[client_id] = None
@@ -600,7 +714,7 @@ def _process_audio_chunk(client_id, audio_to_process):
     
     if _process_audio_chunk._debug_count[client_id] < 5:
         _process_audio_chunk._debug_count[client_id] += 1
-        logger.info(f"[Audio Debug {_process_audio_chunk._debug_count[client_id]}] Client {client_id}: level={audio_level:.6f}, dB={input_db:.2f}, samples={len(audio_to_process)}")
+        logger.debug(f"[Audio Debug {_process_audio_chunk._debug_count[client_id]}] Client {client_id}: level={audio_level:.6f}, dB={input_db:.2f}, samples={len(audio_to_process)}")
     
     # CRITICAL: Process ALL audio through pipeline (VAD, noise reduction, STT)
     # Do NOT skip based on audio level - let VAD determine if it's speech
@@ -629,7 +743,7 @@ def _process_audio_chunk(client_id, audio_to_process):
     _process_audio_chunk._emit_count[client_id] += 1
     
     if _process_audio_chunk._emit_count[client_id] <= 3:
-        logger.info(f"[Emit Debug {_process_audio_chunk._emit_count[client_id]}] Emitting processed_audio to {client_id[:8]}... (has_speech={is_speech}, {len(audio_b64)} bytes)")
+        logger.debug(f"[Emit Debug {_process_audio_chunk._emit_count[client_id]}] Emitting processed_audio to {client_id[:8]}... (has_speech={is_speech}, {len(audio_b64)} bytes)")
     
     try:
         socketio.emit('processed_audio', {

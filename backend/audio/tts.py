@@ -4,6 +4,8 @@ import logging
 import re
 import os
 import sys
+import subprocess
+import inspect
 
 # CRITICAL: Disable MPS BEFORE any torch imports (for MeloTTS on macOS)
 if sys.platform == "darwin":
@@ -23,11 +25,18 @@ except ImportError:
 
 try:
     import torch
-    from transformers import AutoProcessor, VitsModel
     _HAS_TORCH = True
 except ImportError:
     _HAS_TORCH = False
     torch = None
+
+try:
+    from transformers import AutoProcessor, VitsModel
+    _HAS_TRANSFORMERS = True
+except ImportError:
+    _HAS_TRANSFORMERS = False
+    AutoProcessor = None
+    VitsModel = None
 
 # Try to import MeloTTS for Chinese and Japanese
 _HAS_MELOTTS = False
@@ -55,6 +64,13 @@ except ImportError:
     _HAS_PYKOKORO = False
     build_pipeline = None
 
+# Try to import ONNX Runtime for provider/device detection used by PyKokoro
+try:
+    import onnxruntime as ort
+    _HAS_ONNXRUNTIME = True
+except ImportError:
+    ort = None
+    _HAS_ONNXRUNTIME = False
 
 
 logger = logging.getLogger(__name__)
@@ -66,7 +82,7 @@ _mms_model_cache = {}  # Maps (model_id, device_str) -> (model, processor)
 _melotts_cache = {}  # Maps (language, device) -> TTS instance
 
 # Cache for PyKokoro TTS instances (English only)
-_pykokoro_cache_en = None  # English (82M model)
+_pykokoro_cache_en = {}  # Maps device -> English pipeline (82M model)
 
 # Constants for TTS configuration
 SPEED_MIN = 0.5
@@ -234,23 +250,130 @@ def _patch_melotts_for_cpu():
 
 
 def _get_device(device_preference: str) -> str:
-    """Determine the best device to use, avoiding MPS on macOS."""
-    if device_preference != "auto":
-        return device_preference
-    
-    # On macOS, force CPU to avoid MPS issues with BERT models
-    if sys.platform == "darwin":
-        return "cpu"
-    
-    # For other platforms, check for CUDA
+    """Determine execution device, preferring CUDA GPUs when available."""
+    return _get_device_for_engine(device_preference=device_preference, engine="general")
+
+
+def _torch_cuda_available() -> bool:
+    """Return True when PyTorch can use CUDA."""
     try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda:0"
-        else:
+        return torch is not None and torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _onnx_gpu_providers() -> list[str]:
+    """Return ONNX Runtime providers that can execute on GPU."""
+    if not _HAS_ONNXRUNTIME or ort is None:
+        return []
+    try:
+        providers = ort.get_available_providers()
+        gpu_providers = []
+        for name in ("CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider"):
+            if name in providers:
+                gpu_providers.append(name)
+        return gpu_providers
+    except Exception:
+        return []
+
+
+def _onnx_cuda_available() -> bool:
+    """Return True when ONNX Runtime reports CUDA provider availability."""
+    return "CUDAExecutionProvider" in _onnx_gpu_providers()
+
+
+def _get_device_for_engine(device_preference: str, engine: str = "general") -> str:
+    """
+    Determine execution device for the given engine.
+    - general: Torch-based paths (MeloTTS/MMS) rely on torch CUDA availability.
+    - pykokoro: ONNX-based path relies on ONNX Runtime CUDA provider availability.
+    """
+    pref = (device_preference or "auto").lower().strip()
+    if pref in ("gpu", "cuda"):
+        pref = "cuda:0"
+
+    torch_cuda_ok = _torch_cuda_available()
+    onnx_gpu_providers = _onnx_gpu_providers()
+    onnx_cuda_ok = "CUDAExecutionProvider" in onnx_gpu_providers
+    onnx_gpu_ok = len(onnx_gpu_providers) > 0
+    cuda_available = onnx_gpu_ok if engine == "pykokoro" else torch_cuda_ok
+
+    if pref != "auto":
+        if pref.startswith("cuda"):
+            if cuda_available:
+                return "cuda:0" if pref == "cuda" else pref
+            if engine == "pykokoro":
+                logger.warning(
+                    "GPU requested for PyKokoro, but no ONNX Runtime GPU provider is available. "
+                    "Install onnxruntime-gpu (or onnxruntime-directml) and restart. Falling back to CPU."
+                )
+            else:
+                logger.warning("CUDA requested but unavailable. Falling back to CPU.")
             return "cpu"
-    except ImportError:
+        if pref == "mps":
+            try:
+                if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    return "mps"
+            except Exception:
+                pass
+            logger.warning("MPS requested but unavailable. Falling back to CPU.")
+            return "cpu"
+        return pref
+
+    # Auto mode: prefer CUDA on Windows/Linux; prefer MPS on macOS when available.
+    if sys.platform == "darwin":
+        try:
+            if torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
         return "cpu"
+
+    if cuda_available:
+        return "cuda:0"
+
+    if engine == "pykokoro":
+        logger.info(
+            "PyKokoro running on CPU. ONNX Runtime GPU provider not detected. Current providers: %s",
+            ort.get_available_providers() if _HAS_ONNXRUNTIME and ort is not None else ["not-installed"],
+        )
+    return "cpu"
+
+
+def _build_pykokoro_pipeline_for_device(lang: str, target_device: str):
+    """Build a PyKokoro pipeline with provider-aware GPU selection."""
+    from pykokoro import PipelineConfig, GenerationConfig
+
+    generation = GenerationConfig(lang=lang)
+
+    pref = (target_device or "auto").lower().strip()
+    provider = "auto"
+    provider_options = None
+
+    if pref.startswith("cuda"):
+        provider = "cuda"
+        # Allow "cuda:1" style device hints when multiple GPUs exist.
+        if ":" in pref:
+            try:
+                provider_options = {"device_id": int(pref.split(":", 1)[1])}
+            except Exception:
+                provider_options = {"device_id": 0}
+        else:
+            provider_options = {"device_id": 0}
+    elif pref == "cpu":
+        provider = "cpu"
+    elif pref == "mps":
+        # PyKokoro uses CoreML provider naming on Apple platforms.
+        provider = "coreml"
+
+    config = PipelineConfig(
+        generation=generation,
+        provider=provider,
+        provider_options=provider_options,
+    )
+
+    # Force early provider/session initialization so we fail fast instead of silently running CPU.
+    return build_pipeline(config=config, eager=True)
 
 
 def _has_mixed_scripts(text: str) -> bool:
@@ -510,6 +633,44 @@ def _resample_if_needed(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarr
     return _resample_linear(audio, src_sr, dst_sr)
 
 
+def _ensure_spacy_model(model_name: str) -> bool:
+    """
+    Ensure a spaCy language model is available.
+    Returns True if present (or successfully downloaded), False otherwise.
+    """
+    try:
+        import spacy
+    except ImportError:
+        logger.warning("spaCy is not installed; cannot auto-install language model '%s'.", model_name)
+        return False
+
+    try:
+        spacy.load(model_name)
+        return True
+    except OSError:
+        logger.info("spaCy model '%s' not found. Attempting automatic download...", model_name)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "spacy", "download", model_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            spacy.load(model_name)
+            logger.info("✓ spaCy model '%s' downloaded successfully.", model_name)
+            return True
+        except Exception as download_error:
+            logger.warning(
+                "Automatic spaCy model download failed for '%s': %s",
+                model_name,
+                download_error,
+            )
+            return False
+    except Exception as check_error:
+        logger.warning("Unable to verify spaCy model '%s': %s", model_name, check_error)
+        return False
+
+
 def _synthesize_melotts(
     text: str,
     language: str,
@@ -559,15 +720,18 @@ def _synthesize_melotts(
     if sys.platform == "darwin" and device != "cpu":
         logger.warning(f"Overriding device '{device}' to 'cpu' on macOS to avoid MPS issues")
         device = "cpu"
+
+    # MeloTTS accepts "cuda" but not all builds accept "cuda:N" style IDs.
+    melotts_device = "cuda" if isinstance(device, str) and device.startswith("cuda") else device
     
     # Initialize or get cached model
-    cache_key = f"{language}_{device}"
+    cache_key = f"{language}_{melotts_device}"
     if cache_key not in _melotts_cache:
-        logger.info(f"Initializing MeloTTS model for language: {language}, device: {device}")
+        logger.info(f"Initializing MeloTTS model for language: {language}, device: {melotts_device}")
         try:
-            model = _TTS_CLASS(language=language, device=device)
+            model = _TTS_CLASS(language=language, device=melotts_device)
             _melotts_cache[cache_key] = model
-            logger.info(f"✓ MeloTTS model initialized and cached ({language}, {device})")
+            logger.info(f"✓ MeloTTS model initialized and cached ({language}, {melotts_device})")
         except Exception as e:
             logger.error(f"Failed to initialize MeloTTS model: {e}")
             raise RuntimeError(
@@ -580,7 +744,7 @@ def _synthesize_melotts(
                 f"{'  python -m unidic download' if language == 'JP' else ''}"
             ) from e
     else:
-        logger.debug(f"Using cached MeloTTS model ({language}, {device})")
+        logger.debug(f"Using cached MeloTTS model ({language}, {melotts_device})")
     
     model = _melotts_cache[cache_key]
     
@@ -823,7 +987,7 @@ def synthesize_speech(
         text: The content to speak.
         language: Language code ("en", "ja", "zh", etc.) or "auto" for auto-detection.
         speed: Playback speed multiplier (1.0 = normal, 1.2 = 20% faster, 0.9 = 10% slower).
-        device_preference: Device to use ("auto", "cpu", or "mps").
+        device_preference: Device to use ("auto", "cpu", "cuda", "cuda:0", or "mps").
 
     Returns:
         Tuple of (audio_bytes, sample_rate) where audio_bytes is WAV file bytes.
@@ -870,31 +1034,35 @@ def synthesize_speech(
         if _HAS_PYKOKORO:
             try:
                 logger.info(f"Using PyKokoro-82M for English TTS (offline-capable)")
+
+                # PyKokoro English sentence splitting depends on this spaCy model.
+                # Auto-install once if missing to avoid crashing on first use.
+                _ensure_spacy_model("en_core_web_sm")
+                target_device = _get_device_for_engine(device_preference, engine="pykokoro")
                 
                 # Check cache first - use separate cache for English
-                if '_pykokoro_cache_en' not in globals():
-                    _pykokoro_cache_en = None
+                if not isinstance(_pykokoro_cache_en, dict):
+                    _pykokoro_cache_en = {}
                 
-                if _pykokoro_cache_en is None:
-                    logger.info("Initializing PyKokoro TTS pipeline with English language support (82M model)...")
-                    # Configure pipeline for English language
-                    try:
-                        from pykokoro import PipelineConfig, GenerationConfig
-                        config = PipelineConfig(
-                            generation=GenerationConfig(lang='en')
-                        )
-                        _pykokoro_cache_en = build_pipeline(config=config)
-                        logger.info("✓ PyKokoro pipeline initialized and cached (English mode, 82M model)")
-                    except Exception as config_error:
-                        logger.warning(f"Failed to configure English language, using default: {config_error}")
-                        _pykokoro_cache_en = build_pipeline()
-                        logger.info("✓ PyKokoro pipeline initialized and cached (default mode)")
+                if target_device not in _pykokoro_cache_en:
+                    logger.info(
+                        "Initializing PyKokoro English pipeline (82M model) on device: %s",
+                        target_device,
+                    )
+                    _pykokoro_cache_en[target_device] = _build_pykokoro_pipeline_for_device(
+                        lang='en',
+                        target_device=target_device,
+                    )
+                    logger.info(
+                        "✓ PyKokoro pipeline initialized and cached (English mode, device=%s)",
+                        target_device,
+                    )
                 else:
-                    logger.debug("Using cached PyKokoro pipeline (English)")
+                    logger.debug("Using cached PyKokoro pipeline (English, device=%s)", target_device)
                 
                 # Synthesize with PyKokoro
                 from pykokoro import GenerationConfig
-                result = _pykokoro_cache_en.run(text, generation=GenerationConfig(lang='en'))
+                result = _pykokoro_cache_en[target_device].run(text, generation=GenerationConfig(lang='en'))
                 
                 # Extract audio data from AudioResult
                 audio_array = result.audio
@@ -932,8 +1100,15 @@ def synthesize_speech(
                 
                 # Provide helpful error messages for common issues
                 if "spacy" in error_msg.lower() or "en_core_web_sm" in error_msg.lower():
+                    auto_fix_hint = ""
+                    if _ensure_spacy_model("en_core_web_sm"):
+                        auto_fix_hint = (
+                            "Automatic model installation completed. "
+                            "Please retry the request.\n"
+                        )
                     raise RuntimeError(
                         f"PyKokoro requires spaCy language models for English. "
+                        f"{auto_fix_hint}"
                         f"Install with:\n"
                         f"  pip install spacy\n"
                         f"  python -m spacy download en_core_web_sm  # Required for English\n"
@@ -995,317 +1170,7 @@ def synthesize_speech(
                     ) from e
             raise
     
-    # Legacy Chinese TTS code (kept for reference, but should not be reached)
-    if False and language_lower in ["zh", "cmn", "zho", "chinese", "mandarin", "zh-cn"]:
-        if not _HAS_MELOTTS:
-            raise RuntimeError(
-                "MeloTTS is not installed. Install with:\n"
-                "  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                "  cd MeloTTS\n"
-                "  pip install -e .\n"
-                "\nOr via pip:\n"
-                "  pip install melotts"
-            )
-        
-        # Patch for macOS before initializing
-        if sys.platform == "darwin":
-            _patch_melotts_for_cpu()
-        
-        # Get device
-        device = _get_device(device_preference)
-        if sys.platform == "darwin" and device != "cpu":
-            logger.warning(f"Overriding device '{device}' to 'cpu' on macOS to avoid MPS issues")
-            device = "cpu"
-        
-        # Initialize or get cached model
-        cache_key = f"ZH_{device}"
-        
-        if cache_key not in _melotts_cache:
-            logger.info(f"Initializing MeloTTS model for language: ZH, device: {device}")
-            try:
-                model = _TTS_CLASS(language='ZH', device=device)
-                _melotts_cache[cache_key] = model
-                logger.info(f"✓ MeloTTS model initialized and cached (ZH, {device})")
-            except Exception as e:
-                logger.error(f"Failed to initialize MeloTTS model: {e}")
-                raise RuntimeError(
-                    f"Failed to initialize MeloTTS for Chinese. "
-                    f"Error: {e}\n\n"
-                    f"Installation:\n"
-                    f"  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                    f"  cd MeloTTS\n"
-                    f"  pip install -e ."
-                ) from e
-        else:
-            logger.debug(f"Using cached MeloTTS model (ZH, {device})")
-        
-        model = _melotts_cache[cache_key]
-        
-        # Get speaker ID (required for quality synthesis) - matching test_melotts_chinese.py
-        speaker_id = None
-        speaker_name = None
-        try:
-            speaker_ids = model.hps.data.spk2id
-            logger.info(f"Available speakers: {list(speaker_ids.keys())}")
-            
-            # Try to find a Chinese speaker
-            if 'ZH' in speaker_ids:
-                speaker_id = speaker_ids['ZH']
-                speaker_name = 'ZH'
-            elif 'Chinese' in speaker_ids:
-                speaker_id = speaker_ids['Chinese']
-                speaker_name = 'Chinese'
-            elif 'CN' in speaker_ids:
-                speaker_id = speaker_ids['CN']
-                speaker_name = 'CN'
-            else:
-                # Use first available speaker
-                speaker_name = list(speaker_ids.keys())[0]
-                speaker_id = speaker_ids[speaker_name]
-            
-            logger.info(f"Using speaker: {speaker_name} (ID: {speaker_id}) for Chinese")
-        except Exception as e:
-            logger.error(f"Could not get speaker IDs: {e}")
-            # Try to get speaker IDs from model directly as fallback
-            try:
-                if hasattr(model, 'hps') and hasattr(model.hps, 'data') and hasattr(model.hps.data, 'spk2id'):
-                    speaker_ids = model.hps.data.spk2id
-                    logger.info(f"Fallback: Available speakers: {list(speaker_ids.keys())}")
-                    speaker_name = list(speaker_ids.keys())[0]
-                    speaker_id = speaker_ids[speaker_name]
-                    logger.info(f"Fallback: Using first available speaker: {speaker_name} (ID: {speaker_id})")
-                else:
-                    raise ValueError("Cannot access speaker IDs from model")
-            except Exception as e2:
-                logger.error(f"All fallbacks failed, using speaker_id=0: {e2}")
-                speaker_id = 0  # Last resort default
-                speaker_name = "default"
-        
-        # Synthesize speech - process sentence by sentence (matching test_melotts_chinese.py)
-        try:
-            # Split text into sentences for processing (preserve segmentation for long context)
-            # Split by Chinese punctuation marks, but keep punctuation with the sentence
-            # Use lookahead to split on punctuation but keep it
-            sentences = re.split(r'([。！？；])', text)
-            # Recombine punctuation with previous sentence
-            text_segments = []
-            for i in range(0, len(sentences), 2):
-                if i + 1 < len(sentences):
-                    segment = sentences[i] + sentences[i + 1]
-                else:
-                    segment = sentences[i]
-                segment = segment.strip()
-                # Only add non-empty segments with actual content (more than just punctuation)
-                if segment and len(segment.strip('。！？；，、：')) > 0:
-                    text_segments.append(segment)
-            if not text_segments:
-                text_segments = [text.strip()] if text.strip() else []
-            
-            logger.debug(f"Chinese text split into {len(text_segments)} sentence segments for processing")
-            
-            # Ensure speed is valid (MeloTTS expects speed > 0)
-            if speed <= 0:
-                speed = 1.0
-            speed = max(0.5, min(2.0, speed))  # Clamp between 0.5x and 2.0x
-            # Apply Chinese TTS speed adjustment for more natural, human-like speech
-            # 0.75x provides better clarity and natural rhythm (not too slow, not too fast)
-            speed = speed * 0.75
-            
-            # Process each sentence one by one (matching test script approach)
-            import tempfile
-            audio_segments = []
-            sample_rate = None
-            
-            for idx, sentence in enumerate(text_segments):
-                if not sentence.strip():
-                    continue
-                
-                logger.debug(f"Processing sentence {idx + 1}/{len(text_segments)}: '{sentence[:30]}...'")
-                
-                # Use temporary file like test script does
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                    tmp_path = tmp_file.name
-                
-                try:
-                    # Synthesize to file exactly like test script (matching test_melotts_chinese.py line 293-298)
-                    model.tts_to_file(
-                        sentence,
-                        speaker_id,
-                        tmp_path,
-                        speed=speed
-                    )
-                    
-                    # Read the generated audio file
-                    seg_audio, seg_sr = sf.read(tmp_path, dtype='float32')
-                    if sample_rate is None:
-                        sample_rate = int(seg_sr)
-                    
-                    # Convert to mono if stereo
-                    if len(seg_audio.shape) > 1:
-                        seg_audio = np.mean(seg_audio, axis=1)
-                    
-                    # Ensure float32
-                    seg_audio = seg_audio.astype(np.float32)
-                    
-                    # Minimal normalization - only if values are clearly out of range
-                    max_val = np.abs(seg_audio).max()
-                    if max_val > 1.0:
-                        seg_audio = seg_audio / max_val
-                    elif max_val > 32767:
-                        seg_audio = seg_audio / 32768.0
-                    
-                    audio_segments.append(seg_audio)
-                    
-                    # Add natural pauses between sentences (human-like speech patterns)
-                    # Vary pause duration: longer after periods, shorter after commas
-                    if idx < len(text_segments) - 1:
-                        # Check if current sentence ends with period/full stop (longer pause)
-                        current_sentence = text_segments[idx]
-                        
-                        # Determine pause duration based on punctuation
-                        if current_sentence.rstrip().endswith(('。', '！', '？')):
-                            # Longer pause after sentence-ending punctuation (0.3-0.5 seconds)
-                            pause_duration = 0.4 + (idx % 3) * 0.05  # Slight variation: 0.4-0.5s
-                        elif current_sentence.rstrip().endswith(('，', '、', '：', '；')):
-                            # Medium pause after commas/semicolons (0.15-0.25 seconds)
-                            pause_duration = 0.2 + (idx % 2) * 0.05  # Variation: 0.2-0.25s
-                        else:
-                            # Default pause between segments (0.2-0.3 seconds)
-                            pause_duration = 0.25 + (idx % 2) * 0.05  # Variation: 0.25-0.3s
-                        
-                        pause = np.zeros(int(sample_rate * pause_duration), dtype=np.float32)
-                        # Add a very subtle fade-in/fade-out to pauses for more natural sound
-                        fade_samples = min(100, len(pause) // 10)
-                        if fade_samples > 0:
-                            fade_curve = np.linspace(0, 1, fade_samples)
-                            pause[:fade_samples] *= fade_curve
-                            pause[-fade_samples:] *= fade_curve[::-1]
-                        audio_segments.append(pause)
-                        
-                finally:
-                    # Clean up temp file
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-            
-            # Concatenate all sentence audio segments
-            if audio_segments:
-                audio_array = np.concatenate(audio_segments)
-            else:
-                raise RuntimeError("No audio segments generated")
-            
-            # Convert to bytes (WAV format)
-            output_buffer = io.BytesIO()
-            try:
-                sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), samplerate=sample_rate, format='WAV')
-                audio_bytes = output_buffer.getvalue()
-                logger.info(f"✓ MeloTTS synthesis successful ({len(audio_bytes)} bytes, {sample_rate} Hz, {len(text_segments)} sentences)")
-                if original_text != text:
-                    logger.info(f"Chinese TTS input normalized: '{original_text[:40]}...' -> '{text[:40]}...'")
-                return audio_bytes, sample_rate
-            finally:
-                output_buffer.close()
-                
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"MeloTTS synthesis error: {e}", exc_info=True)
-            
-            # Check if it's an NLTK resource error (for mixed Chinese-English text)
-            if "averaged_perceptron_tagger_eng" in error_msg or ("NLTK" in error_msg and "not found" in error_msg):
-                # Try to automatically download the NLTK resource
-                try:
-                    logger.info("Attempting to automatically download NLTK resource 'averaged_perceptron_tagger_eng'...")
-                    import nltk
-                    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
-                    logger.info("✓ NLTK resource downloaded successfully. Retrying entire synthesis...")
-                    
-                    # Retry the entire synthesis from the beginning
-                    import tempfile
-                    retry_audio_segments = []
-                    retry_sample_rate = None
-                    
-                    for idx, sentence in enumerate(text_segments):
-                        if not sentence.strip():
-                            continue
-                        
-                        logger.debug(f"Retrying sentence {idx + 1}/{len(text_segments)}: '{sentence[:30]}...'")
-                        
-                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                            tmp_path = tmp_file.name
-                        
-                        try:
-                            model.tts_to_file(
-                                sentence,
-                                speaker_id,
-                                tmp_path,
-                                speed=speed
-                            )
-                            
-                            seg_audio, seg_sr = sf.read(tmp_path, dtype='float32')
-                            if retry_sample_rate is None:
-                                retry_sample_rate = int(seg_sr)
-                            
-                            if len(seg_audio.shape) > 1:
-                                seg_audio = np.mean(seg_audio, axis=1)
-                            
-                            seg_audio = seg_audio.astype(np.float32)
-                            
-                            max_val = np.abs(seg_audio).max()
-                            if max_val > 1.0:
-                                seg_audio = seg_audio / max_val
-                            elif max_val > 32767:
-                                seg_audio = seg_audio / 32768.0
-                            
-                            retry_audio_segments.append(seg_audio)
-                            
-                            if idx < len(text_segments) - 1:
-                                pause = np.zeros(int(retry_sample_rate * 0.1), dtype=np.float32)
-                                retry_audio_segments.append(pause)
-                                
-                        finally:
-                            try:
-                                os.unlink(tmp_path)
-                            except Exception:
-                                pass
-                    
-                    # Concatenate and return
-                    if retry_audio_segments:
-                        audio_array = np.concatenate(retry_audio_segments)
-                        output_buffer = io.BytesIO()
-                        try:
-                            sf.write(output_buffer, np.clip(audio_array, -1.0, 1.0), samplerate=retry_sample_rate, format='WAV')
-                            audio_bytes = output_buffer.getvalue()
-                            logger.info(f"✓ MeloTTS synthesis successful after NLTK download ({len(audio_bytes)} bytes, {retry_sample_rate} Hz)")
-                            return audio_bytes, retry_sample_rate
-                        finally:
-                            output_buffer.close()
-                    else:
-                        raise RuntimeError("No audio segments generated after NLTK download and retry")
-                        
-                except Exception as nltk_error:
-                    logger.error(f"Failed to automatically download/use NLTK resource: {nltk_error}")
-                    raise RuntimeError(
-                        f"MeloTTS requires NLTK resources for processing mixed Chinese-English text.\n\n"
-                        f"INSTALLATION:\n"
-                        f"1. Install NLTK (if not already installed):\n"
-                        f"   pip install nltk\n\n"
-                        f"2. Download the required NLTK resource:\n"
-                        f"   python -c \"import nltk; nltk.download('averaged_perceptron_tagger_eng')\"\n\n"
-                        f"   OR download all NLTK data:\n"
-                        f"   python -c \"import nltk; nltk.download('all')\"\n\n"
-                        f"3. Restart the server\n\n"
-                        f"This is required when Chinese text contains English words (like 'GDP').\n"
-                        f"Original error: {error_msg[:200]}"
-                    ) from e
-            
-            raise RuntimeError(
-                f"MeloTTS synthesis failed. Error: {error_msg[:500]}\n\n"
-                f"Installation:\n"
-                f"  git clone https://github.com/myshell-ai/MeloTTS.git\n"
-                f"  cd MeloTTS\n"
-                f"  pip install -e ."
-            ) from e
+    # Chinese synthesis path is implemented via _synthesize_melotts() above.
     
     # For Japanese: Use MeloTTS
     if language_lower in ["ja", "jpn", "japanese"]:
@@ -1526,21 +1391,17 @@ def synthesize_speech(
     model_id = LANGUAGE_MODEL_MAP.get(language_lower)
     
     # If MMS-TTS model exists for this language, use it (fallback only, English should use PyKokoro above)
-    if model_id is not None and _HAS_TORCH:
+    if model_id is not None and _HAS_TORCH and _HAS_TRANSFORMERS:
         try:
             logger.info(f"Using MMS-TTS model for language: {language} (offline-capable)")
             
-            # Set up device
-            if device_preference == "mps":
-                device = (
-                    torch.device("mps")
-                    if torch.backends.mps.is_available()
-                    else torch.device("cpu")
-                )
-            elif device_preference == "cpu":
+            # Set up device with unified selection logic (auto prefers CUDA when available)
+            selected_device = _get_device(device_preference)
+            try:
+                device = torch.device(selected_device)
+            except Exception:
+                logger.warning("Invalid device '%s' for MMS-TTS. Falling back to CPU.", selected_device)
                 device = torch.device("cpu")
-            else:
-                device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
             
             # Check cache first to avoid reloading model on each request
             cache_key = f"{model_id}_{device}"
@@ -1660,7 +1521,7 @@ def synthesize_speech(
     if _HAS_MELOTTS:
         supported.append("zh/chinese (MeloTTS - offline-capable)")
         supported.append("ja/japanese (MeloTTS - offline-capable)")
-    elif _HAS_TORCH:
+    elif _HAS_TORCH and _HAS_TRANSFORMERS:
         # Fallback to MMS-TTS if PyKokoro not available
         supported.append("en/english (MMS-TTS - offline-capable, deprecated)")
     
