@@ -213,3 +213,5 @@ __marimo__/
 test_blackhole.py
 .log
 MeloTTS/
+backend(prev)/
+frontend(prev)/

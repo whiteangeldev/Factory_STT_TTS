@@ -199,10 +199,10 @@ class SystemAudioCapture:
                     audio_callback._debug_count = 0
                 if audio_callback._debug_count < 5:
                     audio_callback._debug_count += 1
-                    logger.info(f"[SystemAudio Debug {audio_callback._debug_count}] shape={indata.shape}, raw_max={raw_max:.6f}, mono_max={mono_max:.6f}, samples={len(audio_float)}")
+                    logger.debug(f"[SystemAudio Debug {audio_callback._debug_count}] shape={indata.shape}, raw_max={raw_max:.6f}, mono_max={mono_max:.6f}, samples={len(audio_float)}")
                     # Also log a sample of actual values to see if they're truly zero
                     if audio_callback._debug_count == 1:
-                        logger.info(f"[SystemAudio Sample] First 10 raw values: {indata[:10, 0] if len(indata.shape) > 1 else indata[:10]}")
+                        logger.debug(f"[SystemAudio Sample] First 10 raw values: {indata[:10, 0] if len(indata.shape) > 1 else indata[:10]}")
                 
                 if self.on_audio:
                     self.on_audio(audio_float)
@@ -295,10 +295,10 @@ class SystemAudioCapture:
                 if audio_callback._debug_count < 5:
                     audio_callback._debug_count += 1
                     max_level = np.abs(audio_float).max()
-                    logger.info(f"[SystemAudio Debug {audio_callback._debug_count}] pyaudio: raw_int16_max={raw_max_int16}, float_max={max_level:.6f}, samples={len(audio_float)}")
+                    logger.debug(f"[SystemAudio Debug {audio_callback._debug_count}] pyaudio: raw_int16_max={raw_max_int16}, float_max={max_level:.6f}, samples={len(audio_float)}")
                     if audio_callback._debug_count == 1:
-                        logger.info(f"[SystemAudio Sample] First 10 raw int16: {audio_int16[:10]}")
-                        logger.info(f"[SystemAudio Sample] First 10 float32: {audio_float[:10]}")
+                        logger.debug(f"[SystemAudio Sample] First 10 raw int16: {audio_int16[:10]}")
+                        logger.debug(f"[SystemAudio Sample] First 10 float32: {audio_float[:10]}")
                 
                 if self.on_audio:
                     self.on_audio(audio_float)

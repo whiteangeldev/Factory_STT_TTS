@@ -35,8 +35,12 @@ class RNNoise:
             # RNNoise works internally at 48000 Hz
             # We'll handle resampling if needed
             self.denoiser = rnnoise.RNNoise(sample_rate=48000)
-            # Check which method is available (pyrnnoise uses 'filter', not 'process')
-            if hasattr(self.denoiser, 'filter'):
+            # Support multiple pyrnnoise APIs across versions.
+            if hasattr(self.denoiser, 'denoise_frame'):
+                self.process_method = 'denoise_frame'
+            elif hasattr(self.denoiser, 'denoise_chunk'):
+                self.process_method = 'denoise_chunk'
+            elif hasattr(self.denoiser, 'filter'):
                 self.process_method = 'filter'
             elif hasattr(self.denoiser, 'process'):
                 self.process_method = 'process'
@@ -44,7 +48,7 @@ class RNNoise:
                 # Some versions are callable directly
                 self.process_method = '__call__'
             else:
-                raise AttributeError("RNNoise object has no 'filter' or 'process' method")
+                raise AttributeError("RNNoise object has no recognized denoise method")
             logger.info(f"RNNoise initialized successfully (using method: {self.process_method})")
         except Exception as e:
             logger.error(f"Failed to initialize RNNoise: {e}")
@@ -96,7 +100,11 @@ class RNNoise:
                     frame = np.pad(frame, (0, frame_size - len(frame)), mode='constant')
                 
                 # Process frame using the correct method
-                if self.process_method == 'filter':
+                if self.process_method == 'denoise_frame':
+                    denoised_frame = self.denoiser.denoise_frame(frame)
+                elif self.process_method == 'denoise_chunk':
+                    denoised_frame = self.denoiser.denoise_chunk(frame)
+                elif self.process_method == 'filter':
                     denoised_frame = self.denoiser.filter(frame)
                 elif self.process_method == 'process':
                     denoised_frame = self.denoiser.process(frame)
@@ -104,7 +112,7 @@ class RNNoise:
                     denoised_frame = self.denoiser(frame)
                 else:
                     raise AttributeError(f"Unknown process method: {self.process_method}")
-                output_frames.append(denoised_frame)
+                output_frames.append(self._normalize_denoised_frame_output(denoised_frame, frame))
             
             # Combine frames
             denoised_48k = np.concatenate(output_frames)[:len(audio_int16)]
@@ -143,14 +151,53 @@ class RNNoise:
                 logger.warning(f"RNNoise processing failed: {e}, using original audio")
             elif self._processing_error_count == 4:
                 logger.warning("RNNoise processing errors continuing - suppressing further warnings")
+            elif self._processing_error_count == 10:
+                logger.warning("RNNoise disabled for this session after repeated runtime errors.")
+                self.denoiser = None
+                self.process_method = None
             return audio
+
+    def _normalize_denoised_frame_output(self, denoised_frame, fallback_frame: np.ndarray) -> np.ndarray:
+        """Normalize pyrnnoise frame outputs across versions.
+
+        Some versions return:
+        - ndarray[int16]
+        - tuple(probability, ndarray)
+        - None (in-place style / unsupported path)
+        """
+        if denoised_frame is None:
+            return fallback_frame
+
+        # Tuple/list outputs: pick the last ndarray-like element.
+        if isinstance(denoised_frame, (tuple, list)):
+            for item in reversed(denoised_frame):
+                if isinstance(item, np.ndarray):
+                    denoised_frame = item
+                    break
+            else:
+                return fallback_frame
+
+        try:
+            arr = np.asarray(denoised_frame)
+            if arr.size == 0:
+                return fallback_frame
+            if arr.dtype != np.int16:
+                arr = np.clip(arr, -32768, 32767).astype(np.int16, copy=False)
+            arr = arr.reshape(-1)
+            if arr.shape[0] < fallback_frame.shape[0]:
+                arr = np.pad(arr, (0, fallback_frame.shape[0] - arr.shape[0]), mode='constant')
+            return arr[:fallback_frame.shape[0]]
+        except Exception:
+            return fallback_frame
     
     def _simple_noise_gate(self, audio: np.ndarray, threshold=0.01) -> np.ndarray:
-        """Simple noise gate fallback"""
-        # Simple noise gate: zero out samples below threshold
-        magnitude = np.abs(audio)
-        mask = magnitude > threshold
-        return audio * mask.astype(np.float32)
+        """Safe fallback when RNNoise is unavailable.
+
+        Avoid aggressive gating here because it can delete low-energy consonants
+        and hurt STT accuracy in system-audio capture.
+        """
+        _ = threshold
+        return audio.astype(np.float32, copy=False)
     
     def _upsample(self, audio: np.ndarray, factor: int) -> np.ndarray:
         """Simple linear upsampling"""
